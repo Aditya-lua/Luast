@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .analysis import Analyzer, Binding, analyze, binding_for, is_pure
-from .model import Node, clone_value, iter_nodes, walk
+from .model import Node, children, clone_value, iter_nodes, walk
 
 
 UNKNOWN = object()
@@ -616,17 +616,39 @@ def restore_library_aliases(root: Node, analyzer: Analyzer, stats: PassStats) ->
 
 def remove_unused_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> Node:
     fold_env = constant_environment(analyzer)
+    memo_eligible = memo_guard_bindings(root, analyzer)
 
     def all_dead(bindings: list, values: list) -> bool:
         return all(binding.reads == 0 and binding.writes == 0 for binding in bindings) and all(is_pure(value) for value in values)
 
+    def process_functions(node: Node | None) -> None:
+        """Recurse dead-code cleanup into closures nested in expressions."""
+        if node is None:
+            return
+        if node.kind == "function":
+            node.fields["body"] = process(node.get("body", []))
+            return
+        for field in node.fields.values():
+            if isinstance(field, Node):
+                process_functions(field)
+            elif isinstance(field, (list, tuple)):
+                for item in field:
+                    if isinstance(item, Node):
+                        process_functions(item)
+                    elif isinstance(item, (list, tuple)):
+                        for nested in item:
+                            if isinstance(nested, Node):
+                                process_functions(nested)
+
     def process(statements: list[Node]) -> list[Node]:
         output: list[Node] = []
-        for statement in statements:
+        for position, statement in enumerate(statements):
             kind = statement.kind
             if kind == "local":
                 bindings = analyzer.declaration_bindings.get(id(statement), [])
                 values = statement.get("values", [])
+                for value in values:
+                    process_functions(value)
                 if bindings and len(bindings) == len(statement.get("names", [])):
                     if all_dead(bindings, values):
                         stats.dead_locals += len(bindings)
@@ -634,6 +656,8 @@ def remove_unused_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> No
             elif kind == "assign":
                 targets = statement.get("targets", [])
                 values = statement.get("values", [])
+                for value in values:
+                    process_functions(value)
                 if targets and len(targets) == len(values):
                     dead_targets = []
                     for target in targets:
@@ -641,13 +665,23 @@ def remove_unused_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> No
                             dead_targets = []
                             break
                         binding = binding_for(analyzer, target)
-                        if binding is None or binding.reads != 0:
+                        if binding is None:
                             dead_targets = []
                             break
                         dead_targets.append(binding)
                     if dead_targets and all(is_pure(value) for value in values):
                         stats.dead_locals += len(dead_targets)
                         continue
+                    # Self-referential dead store: `X = {.. X ..}` where the
+                    # only reads of X anywhere are inside the stored value
+                    # itself. Nothing can ever observe the store.
+                    if len(targets) == 1 and targets[0].kind == "name" and is_pure(values[0]):
+                        binding = binding_for(analyzer, targets[0])
+                        if binding is not None and binding.writes >= 1:
+                            internal_reads = sum(1 for node in iter_nodes(values[0]) if isinstance(node, Node) and node.kind == "name" and binding_for(analyzer, node) is binding)
+                            if binding.reads == internal_reads:
+                                stats.dead_locals += 1
+                                continue
             elif kind == "do":
                 statement.fields["body"] = process(statement.get("body", []))
                 if not statement.get("body", []):
@@ -657,6 +691,12 @@ def remove_unused_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> No
                 statement.fields["elifs"] = [(condition, process(body)) for condition, body in statement.get("elifs", [])]
                 statement.fields["else_"] = process(statement.get("else_", []))
                 if not statement.get("then", []) and not statement.get("elifs", []) and not statement.get("else_", []) and is_pure(statement.get("cond")):
+                    continue
+                if self_dead_guard(statement, statements, position, analyzer, fold_env):
+                    stats.branches_removed += 1
+                    continue
+                if remove_memoization_store(statement, analyzer):
+                    stats.dead_locals += 1
                     continue
             elif kind in {"while", "repeat"}:
                 statement.fields["body"] = process(statement.get("body", []))
@@ -673,6 +713,137 @@ def remove_unused_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> No
 
     root.fields["body"] = process(root.get("body", []))
     return root
+
+
+def self_dead_guard(statement: Node, statements: list[Node], position: int, analyzer: Analyzer, environment: dict[int, Any]) -> bool:
+    """Flow-resolve an `if` guard against the most recent prior value of
+    the variable it tests.
+
+    LUAST wraps junk table stores in `if not X then ... end` where X was
+    already initialized to a truthy constant earlier in the same block.
+    The guard is provably false even though X is written elsewhere, which
+    defeats the scope-wide constant environment. Returns True when the
+    guard is provably false and the if has no other branches."""
+    cond = statement.get("cond")
+    if statement.get("elifs") or statement.get("else_"):
+        return False
+    tested = cond
+    negate = False
+    if isinstance(tested, Node) and tested.kind == "unop" and tested.get("op") == "not":
+        tested = tested.get("expr")
+        negate = True
+    if not (isinstance(tested, Node) and tested.kind == "name"):
+        return False
+    binding = binding_for(analyzer, tested)
+    if binding is None:
+        return False
+    prior = _nearest_prior_write(binding, statements, position, analyzer)
+    if prior is UNKNOWN:
+        return False
+    guard_holds = truthy(prior)
+    return guard_holds if negate else not guard_holds
+
+
+def _nearest_prior_write(binding: Binding, statements: list[Node], position: int, analyzer: Analyzer) -> Any:
+    """Most recent known value of binding before `position`, or UNKNOWN.
+
+    nil literals report as None; a declaration without a value also
+    reports None (the variable is nil from that point on)."""
+    for index in range(position - 1, -1, -1):
+        statement = statements[index]
+        if statement.kind == "local":
+            bindings = analyzer.declaration_bindings.get(id(statement), [])
+            values = statement.get("values", [])
+            for slot, (bound, _) in enumerate(zip(bindings, statement.get("names", []))):
+                if bound is binding:
+                    if slot < len(values):
+                        return literal(values[slot])
+                    return None
+        elif statement.kind == "assign":
+            targets = statement.get("targets", [])
+            values = statement.get("values", [])
+            for target, value in zip(targets, values):
+                if target.kind == "name" and binding_for(analyzer, target) is binding:
+                    return literal(value)
+    return UNKNOWN
+
+
+def memo_guard_bindings(root: Node, analyzer: Analyzer) -> set[int]:
+    """Bindings whose every read is either an `if not X` guard or a
+    self-reference inside a table stored back into X.
+
+    For these bindings, dropping the guarded junk stores is unobservable
+    no matter what value X holds at runtime, which unlocks constant pools
+    that only escaped through the stored tables (commonly nested inside
+    decoder closures)."""
+    parents = parent_map_of(root)
+    guard_count: dict[int, int] = {}
+    external: dict[int, bool] = {}
+    for node in walk(root):
+        if node.kind != "name":
+            continue
+        binding = binding_for(analyzer, node)
+        if binding is None:
+            continue
+        parent = parents.get(id(node))
+        if isinstance(parent, Node) and parent.kind == "unop" and parent.get("op") == "not":
+            grand = parents.get(id(parent))
+            if isinstance(grand, Node) and grand.kind == "if" and grand.get("cond") is parent:
+                guard_count[binding.ident] = guard_count.get(binding.ident, 0) + 1
+                continue
+        if isinstance(parent, Node) and parent.kind == "table":
+            table_parent = parents.get(id(parent))
+            if isinstance(table_parent, Node) and table_parent.kind == "assign":
+                targets = table_parent.get("targets", [])
+                if len(targets) == 1 and isinstance(targets[0], Node) and targets[0].kind == "name" and binding_for(analyzer, targets[0]) is binding:
+                    # self-reference inside a stored table: unobservable
+                    continue
+        external[binding.ident] = True
+    return {ident for ident, count in guard_count.items() if count >= 1 and not external.get(ident)}
+
+
+def remove_memoization_store(statement: Node, analyzer: Analyzer, memo_eligible: set[int] | None = None) -> bool:
+    """Detect the junk memoization idiom `if not X then X = <pure> end`.
+
+    When X's only reads anywhere are such guards plus self-references
+    inside the stored values (see memo_guard_bindings), the store is
+    never observable and the whole if-statement is dead. Removing it also
+    un-pins values (e.g. constant pools) that only escaped through the
+    stored table.
+    """
+    cond = statement.get("cond")
+    if not (isinstance(cond, Node) and cond.kind == "unop" and cond.get("op") == "not"):
+        return False
+    guard_expr = cond.get("expr")
+    if not (isinstance(guard_expr, Node) and guard_expr.kind == "name"):
+        return False
+    guard_binding = binding_for(analyzer, guard_expr)
+    if guard_binding is None:
+        return False
+    if memo_eligible is not None and guard_binding.ident not in memo_eligible:
+        return False
+    if statement.get("elifs") or statement.get("else_"):
+        return False
+    body = statement.get("then", [])
+    if len(body) != 1:
+        return False
+    store = body[0]
+    if store.kind != "assign" or len(store.get("targets", [])) != 1 or len(store.get("values", [])) != 1:
+        return False
+    target = store.get("targets", [])[0]
+    if target.kind != "name" or binding_for(analyzer, target) is not guard_binding:
+        return False
+    value = store.get("values", [])[0]
+    if not is_pure(value):
+        return False
+    internal_reads = 0
+    for node in iter_nodes(cond):
+        if isinstance(node, Node) and node.kind == "name" and binding_for(analyzer, node) is guard_binding:
+            internal_reads += 1
+    for node in iter_nodes(value):
+        if isinstance(node, Node) and node.kind == "name" and binding_for(analyzer, node) is guard_binding:
+            internal_reads += 1
+    return guard_binding.writes == 1 and guard_binding.reads == internal_reads
 
 
 def parent_map_of(root: Node) -> dict[int, Node]:
@@ -746,7 +917,7 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
         value = node.get("values", [])[0]
         if target.kind == "name" and value.kind == "table":
             binding = binding_for(analyzer, target)
-            if binding is not None and binding.writes == 1 and binding.reads == 0:
+            if binding is not None and binding.writes == 1:
                 declaration = binding.declaration
                 if isinstance(declaration, Node) and declaration.kind == "local" and not declaration.get("values", []):
                     root_id = aliases.get(binding.ident, binding.ident)
@@ -769,7 +940,17 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
     # Occurrences that keep a pool alive: any value-position read of the
     # pool object or of a slot whose key cannot be resolved.
     alive: set[int] = set()
-    key_reads: dict[int, set[Any]] = {}
+    # Key reads tracked per owning statement: a write in statement S is
+    # dead only if no read outside S observes that key. Lua evaluates all
+    # right-hand values before performing any assignment, so reads inside
+    # the same assignment observe the pre-statement state. Reads inside
+    # function bodies execute at call time and pin everything.
+    deferred: set[int] = set()
+    for node in walk(root):
+        if node.kind == "function" and id(node) not in deferred:
+            for descendant in children(node):
+                deferred.add(id(descendant))
+    key_reads: dict[int, dict[Any, set[int | None]]] = {}
     for node in walk(root):
         if node.kind != "name":
             continue
@@ -789,7 +970,8 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
             if key is UNKNOWN:
                 alive.add(root_id)
             else:
-                key_reads.setdefault(root_id, set()).add(pool_key(key))
+                owner = None if id(parent) in deferred else key_reads_owner(parents, parent)
+                key_reads.setdefault(root_id, {}).setdefault(pool_key(key), set()).add(owner)
             continue
         if isinstance(parent, Node) and parent.kind == "local" and any(value is node for value in parent.get("values", [])):
             # alias declaration; tracked through the alias map
@@ -826,11 +1008,13 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
                             continue
                         if target.kind == "index":
                             root_id = pool_root_of(target.get("obj"))
-                            if root_id is not None and root_id not in alive:
+                            if root_id is not None and root_id not in alive and is_pure(value):
                                 key = literal(target.get("key"))
-                                if key is not UNKNOWN and pool_key(key) not in key_reads.get(root_id, set()):
-                                    removed += 1
-                                    continue
+                                if key is not UNKNOWN:
+                                    owners = key_reads.get(root_id, {}).get(pool_key(key), set())
+                                    if not owners - {id(statement)}:
+                                        removed += 1
+                                        continue
                         droppable = False
                         kept_targets.append(target)
                         kept_values.append(value)
@@ -879,6 +1063,26 @@ def pool_key(value: Any) -> tuple[Any, ...]:
     if isinstance(value, bytes):
         return ("string", value)
     return ("other", str(value))
+
+
+STATEMENT_KINDS = {"assign", "local", "call", "methodcall", "return", "if", "while", "repeat", "fornum", "forin", "do", "localfunc", "funcdef", "goto", "label"}
+
+
+def key_reads_owner(parents: dict[int, Node], index_node: Node) -> int | None:
+    """Identify the nearest enclosing statement of a pool read.
+
+    Reads lexically inside a function body execute at call time, so they
+    are attributed to None (they pin writes from every statement)."""
+    current: Node | None = index_node
+    for _ in range(256):
+        current = parents.get(id(current)) if current is not None else None
+        if current is None:
+            return None
+        if current.kind == "function":
+            return None
+        if current.kind in STATEMENT_KINDS:
+            return id(current)
+    return None
 
 
 @dataclass

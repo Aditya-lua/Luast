@@ -52,6 +52,7 @@ class DispatcherPass:
         self.max_states = 4096
         self.max_paths = 96
         self.max_work = 400000
+        self.emit_budget = 40000
         self.work = 0
         self.base_env = constant_environment(analyzer)
 
@@ -552,6 +553,7 @@ class DispatcherPass:
 
     def recover(self, dispatcher: Dispatcher) -> Node | None:
         self.work = 0
+        self.emit_budget = 40000
         graph: dict[Any, list[DispatchPath]] = {}
         initial = self.apply_transform(dispatcher.initial, dispatcher.transform)
         queue: list[tuple[int | float, dict[int, Any]]] = [(initial, dict(self.base_env))]
@@ -636,6 +638,9 @@ class DispatcherPass:
     def emit_paths(self, paths: list[DispatchPath], graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None) -> list[Node] | None:
         if not paths:
             return []
+        self.emit_budget -= 1
+        if self.emit_budget < 0:
+            raise DispatcherBail("emit budget")
         if len(paths) == 1 and not paths[0].conditions:
             return self.emit_path(paths[0], graph, stack, depth, in_loop, loop_header)
         unconditional = [path for path in paths if not path.conditions]
@@ -673,6 +678,9 @@ class DispatcherPass:
         return [Node("if", condition.start, condition.end, cond=condition, then=then_body, elifs=[], else_=else_body)]
 
     def emit_path(self, path: DispatchPath, graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None) -> list[Node] | None:
+        self.emit_budget -= len(path.actions) + 2
+        if self.emit_budget < 0:
+            raise DispatcherBail("emit budget")
         actions = [action.clone() for action in path.actions]
         if actions and any(action.kind in {"local", "localfunc"} for action in actions):
             actions = [Node("do", actions[0].start, actions[-1].end, body=actions)]
