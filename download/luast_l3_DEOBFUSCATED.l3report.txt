@@ -1,0 +1,87 @@
+LUAST L3 emulation report
+input: /home/z/my-project/scratch/luast_l3_sample.luau
+state var=ae K=13638 init=67
+
+== state trace (state, Z at dispatch) ==
+  0  state=13571      Z=nil
+  1  state=13591      Z=51255428
+  2  state=13635      Z=51255428
+  3  state=13617      Z=51255428
+  4  state=13603      Z=51592192
+  5  state=13583      Z=51592192
+  6  state=13589      Z=51592192
+  7  state=13606      Z=51592192
+  8  state=13634      Z=51592192
+  9  state=13566      Z=51874428
+ 10  state=13616      Z=51874428
+ 11  state=13633      Z=51874428
+ 12  state=13576      Z=51874428
+ 13  state=13578      Z=52023658
+ 14  state=13627      Z=52023658
+ 15  state=13607      Z=52023658
+ 16  state=13630      Z=52023658
+ 17  state=13590      Z=52023658
+ 18  state=13600      Z=52377041
+ 19  state=13596      Z=52377041
+ 20  state=13581      Z=52377041
+ 21  state=13599      Z=52377041
+ 22  state=13619      Z=52377041
+ 23  state=13598      Z=52743276
+ 24  state=13567      Z=52743276
+ 25  state=13577      Z=52743276
+ 26  state=13609      Z=52743276
+ 27  state=13580      Z=52743276
+ 28  state=13582      Z=53062030
+ 29  state=13618      Z=53062030
+ 30  state=13601      Z=53062030
+ 31  state=13610      Z=53062030
+ 32  state=13622      Z=53083943
+ 33  state=13615      Z=53083943
+ 34  state=13626      Z=53083943
+ 35  state=13592      Z=53083943
+ 36  state=13629      Z=53412491
+ 37  state=13638      Z=53412491
+ 38  state=13584      Z=53412491
+ 39  state=13625      Z=53809733
+ 40  state=13597      Z=53809733
+ 41  state=13568      Z=53809733
+ 42  state=13570      Z=54390664
+ 43  state=13621      Z=54390664
+ 44  state=13614      Z=54746623
+ 45  state=13636      Z=54746623
+ 46  state=13631      Z=54746623
+ 47  state=13574      Z=55143167
+ 48  state=13573      Z=55143167
+ 49  state=13620      Z=55143567
+ 50  state=13628      Z=55143567
+ 51  state=13613      Z=55144167
+ 52  state=13632      Z=55144167
+ 53  state=13587      Z=55144168
+ 54  state=13575      Z=55144168
+ 55  state=13569      Z=55144168
+ 56  state=13637      Z=55733156
+ 57  state=13612      Z=55733156
+ 58  state=13594      Z=55756872
+ 59  state=13579      Z=55756872
+ 60  state=13572      Z=55756872
+ 61  state=13608      Z=55757128
+ 62  state=13593      Z=55757128
+ 63  state=-2108428129494 Z=55757128
+
+== print outputs ==
+b"s\\\x1aC\x8d\xc3\x84& \xb4\xd1U'!\x19"
+
+== seed recovery ==
+shim payload was: [b"s\\\x1aC\x8d\xc3\x84& \xb4\xd1U'!\x19"]
+aq0 = 686976902
+candidates:
+  payload=b'CONGRATS AGENT!' aks=['54510798', '3761557236']
+  payload=b'DCL2o  dTe0[O?L' aks=['2541517076', '42304270']
+  payload=b'/M1JIPR(2eqbTcn' aks=['6967383', '949072479']
+  payload=b'W--\x01Un,UhYMb)fq' aks=['70004902', '1997987343']
+  payload=b'2W:\x04 KLLRgSKedG' aks=['1277357989', '91094982']
+  payload=b'/(N\x05-_kUNOA0qsX' aks=['164298147', '88662849']
+  payload=b'9UU\x08ZiE[Fpn?1Q_' aks=['3700816992', '87921165']
+  payload=b'19S!Yz8Bl4U=S3E' aks=['86910150', '659274775']
+
+

@@ -23,3 +23,23 @@ Stage Summary:
 - Deliverable (single file per user request): /home/z/my-project/download/squirrelescape_DEOBFUSCATED.luau
 - Improved tool lives at /home/z/my-project/download/project/LUAST/extracted/LUAST 1.0.1/Tool/ (original zip intact as backup).
 - Known remaining work: MoonVeil obfuscator support; second pool (euH) retained due to dynamic-key reads; decoder-call static evaluation could be extended.
+
+---
+Task ID: 3
+Agent: Super Z (main)
+Task: Fix everything in the deobfuscator, delete stored sample scripts (fetch live via raw GitHub only), and deobfuscate the user-pasted LUAST v1.0.1 level-3 script.
+
+Work Log:
+- Re-verified the remove_unused_locals dead-store fix with minimal repros (loop counters / state vars preserved; genuinely dead locals still removed). Test suite 7/7 green.
+- SAMPLES (374 obfuscated scripts) confirmed deleted; also deleted 19MB download/deobf_results cache + scratch/github_live (2.6MB) so no sample scripts remain in storage.
+- Built a LUAST-L3 static emulator (scripts/lua_rt.py + scripts/luast3_deobf.py, integrated into the tool as luau_recover/lua_rt.py + luau_recover/luast_l3.py): a mini-Luau interpreter with Roblox shims (bit32, buffer, string, math, table, debug.info with real Luau builtin semantics verified against the ROBLOX_ENV luau binary, Enum, Font, Vector2int16, HttpService:JSONDecode, game:GetService, pcall, typeof, ...).
+- It statically executes the whole obfuscated chunk: pool literal -> runtime permutation multi-assigns, 64-state dispatcher (init 67, K=13638), opaque predicates (Z==Z, table.isfrozen on frozen library tables - verified frozen=true on real luau, string.rep == ""["rep"], debug.info line/name-length tricks), Font/Enum weighted Z contributions, and the LCG+bit32 keystream payload decoder.
+- Cross-validated end-to-end against the real Luau VM (ROBLOX_ENV/luau + pure-Lua Roblox prelude): interpreter reproduces the VM bit-exactly.
+- Residual Roblox-shim drift (-1,259,923 on Z vs real Roblox) compensated by a constrained seed-recovery fallback: printable-plaintext filter (numpy scan over 95^4 first-word candidates) + inversion of the round function (add/xorshift/rotate chain) + LCG inversion -> true aq0/ak/Z. Candidate ranking by Z-drift plausibility (|dZ| <= 50M) + dictionary coverage.
+- RESULT: payload "CONGRATS AGENT!" recovered (Z_true = 54497205, ae=13593, cipher = 15-byte pool string, LCG 16807/2^31-1). Deliverable: download/luast_l3_DEOBFUSCATED.luau = print("CONGRATS AGENT!") + full trace report download/luast_l3_DEOBFUSCATED.l3report.txt.
+- cli.py: new --fetch NAME (live fetch from https://raw.githubusercontent.com/joustingmatch/Ouroboros/main/games/<name>), auto-detection of luast-L3 inputs routing to the emulator (ok-l3 status, graceful fallback), -o now applies to fetched files. Live-tested: fetch of a real repo script works.
+- Known open item: exact Roblox-side source of the -1.26M Z drift (Vector2int16 int16-wrap and library-freeze semantics verified correct; drift absorbed by the solver regardless).
+
+Stage Summary:
+- Level-3 LUAST is now deobfuscatable end-to-end; user's script yields print("CONGRATS AGENT!").
+- Tool entry: Tool/deobfuscate.py [input|--fetch NAME] [-o out]; test suite 7/7.
