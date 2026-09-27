@@ -1,0 +1,539 @@
+    53→    def apply(self, rounds: int = 8) -> int:
+    54→        completed = 0
+    55→        for _ in range(rounds):
+    56→            changed = False
+    57→            lists = self.statement_lists(self.root)
+    58→            candidates: list[Dispatcher] = []
+    59→            for statements in lists:
+    60→                for index, statement in enumerate(statements):
+    61→                    if statement.kind != "while":
+    62→                        continue
+    63→                    candidate = self.recognize(statements, index, statement)
+    64→                    if candidate is not None:
+    65→                        candidates.append(candidate)
+    66→            candidates.sort(key=lambda item: item.loop.start, reverse=True)
+    67→            for candidate in candidates:
+    68→                try:
+    69→                    replacement = self.recover(candidate)
+    70→                except DispatcherBail:
+    71→                    continue
+    72→                except (RecursionError, OverflowError, ValueError, TypeError):
+    73→                    continue
+    74→                if replacement is None:
+    75→                    continue
+    76→                candidate.statements[candidate.index] = replacement
+    77→                self.stats.dispatchers_removed += 1
+    78→                completed += 1
+    79→                changed = True
+    80→            if not changed:
+    81→                break
+    82→        return completed
+    83→
+    84→    def statement_lists(self, root: Node) -> list[list[Node]]:
+    85→        result: list[list[Node]] = []
+    86→        seen: set[int] = set()
+    87→
+    88→        def add(statements: object) -> None:
+    89→            if isinstance(statements, list) and id(statements) not in seen:
+    90→                seen.add(id(statements))
+    91→                result.append(statements)
+    92→
+    93→        add(root.fields.get("body", []))
+    94→        for node in walk(root):
+    95→            for key in ("body", "then", "else_"):
+    96→                add(node.fields.get(key))
+    97→            for _, body in node.fields.get("elifs", []):
+    98→                add(body)
+    99→        return result
+   100→
+   101→    def recognize(self, statements: list[Node], index: int, loop: Node) -> Dispatcher | None:
+   102→        if not self.is_true(loop.get("cond")):
+   103→            return None
+   104→        body = loop.get("body", [])
+   105→        if not body:
+   106→            return None
+   107→        head = body[0]
+   108→        if head.kind != "assign" or len(head.get("targets", [])) != 1 or len(head.get("values", [])) != 1:
+   109→            return None
+   110→        target = head.get("targets", [])[0]
+   111→        if target.kind != "name":
+   112→            return None
+   113→        state = binding_for(self.analyzer, target)
+   114→        if state is None:
+   115→            return None
+   116→        transform = self.transition(head.get("values", [])[0], state)
+   117→        if transform is None:
+   118→            return None
+   119→        initial = self.initial_value(statements, index, state)
+   120→        if initial is None:
+   121→            return None
+   122→        tree = body[1:]
+   123→        if len(tree) == 1 and tree[0].kind == "do":
+   124→            tree = tree[0].get("body", [])
+   125→        if not self.looks_like_dispatch(tree, state):
+   126→            return None
+   127→        return Dispatcher(loop, statements, index, state, initial, transform, tree)
+   128→
+   129→    def is_true(self, node: Node) -> bool:
+   130→        return isinstance(node, Node) and node.kind == "bool" and node.get("value") is True
+   131→
+   132→    def transition(self, expression: Node, state: Binding) -> tuple[str, int | float] | None:
+   133→        if expression.kind == "binop" and expression.get("op") == "-":
+   134→            left = expression.get("left")
+   135→            right = expression.get("right")
+   136→            if self.is_state(right, state) and self.is_number_node(left):
+   137→                return ("complement", left.get("value"))
+   138→            if self.is_state(left, state) and self.is_number_node(right):
+   139→                return ("negate", right.get("value"))
+   140→        if expression.kind == "call":
+   141→            name = self.dotted_name(expression.get("func"))
+   142→            args = expression.get("args", [])
+   143→            if name == "bit32.bxor" and len(args) == 2 and self.is_state(args[0], state) and self.is_number_node(args[1]):
+   144→                return ("xor", args[1].get("value"))
+   145→            if name == "bit32.bxor" and len(args) == 2 and self.is_state(args[1], state) and self.is_number_node(args[0]):
+   146→                return ("xor", args[0].get("value"))
+   147→        return None
+   148→
+   149→    def dotted_name(self, node: Node | None) -> str | None:
+   150→        if not isinstance(node, Node):
+   151→            return None
+   152→        if node.kind == "name":
+   153→            return node.get("name")
+   154→        if node.kind == "indexname":
+   155→            base = self.dotted_name(node.get("obj"))
+   156→            return base + "." + node.get("name", "") if base else None
+   157→        return None
+   158→
+   159→    def is_state(self, node: Node | None, state: Binding) -> bool:
+   160→        return isinstance(node, Node) and node.kind == "name" and binding_for(self.analyzer, node) is state
+   161→
+   162→    def is_number_node(self, node: Node | None) -> bool:
+   163→        return isinstance(node, Node) and node.kind == "number" and is_number(node.get("value"))
+   164→
+   165→    def initial_value(self, statements: list[Node], index: int, state: Binding) -> int | float | None:
+   166→        for statement in reversed(statements[:index]):
+   167→            if statement.kind == "local":
+   168→                bindings = self.analyzer.declaration_bindings.get(id(statement), [])
+   169→                names = statement.get("names", [])
+   170→                for binding, value in zip(bindings, statement.get("values", [])):
+   171→                    if binding is state and self.is_number_node(value):
+   172→                        return value.get("value")
+   173→                if state.name in names:
+   174→                    return None
+   175→            if statement.kind == "assign":
+   176→                for target, value in zip(statement.get("targets", []), statement.get("values", [])):
+   177→                    if target.kind == "name" and binding_for(self.analyzer, target) is state:
+   178→                        return value.get("value") if self.is_number_node(value) else None
+   179→            if any(child.kind == "name" and binding_for(self.analyzer, child) is state for child in self.node_children(statement)):
+   180→                return None
+   181→        return None
+   182→
+   183→    def node_children(self, node: Node) -> list[Node]:
+   184→        result: list[Node] = []
+   185→        for value in node.fields.values():
+   186→            if isinstance(value, Node):
+   187→                result.append(value)
+   188→            elif isinstance(value, (list, tuple)):
+   189→                for item in value:
+   190→                    if isinstance(item, Node):
+   191→                        result.append(item)
+   192→                    elif isinstance(item, (list, tuple)):
+   193→                        result.extend(item for item in item if isinstance(item, Node))
+   194→        return result
+   195→
+   196→    def looks_like_dispatch(self, tree: list[Node], state: Binding) -> bool:
+   197→        found = False
+   198→        for node in tree:
+   199→            for child in self.node_children(node):
+   200→                if child.kind == "binop" and child.get("op") in {"<", "<=", ">", ">=", "==", "~="}:
+   201→                    if self.is_state(child.get("left"), state) or self.is_state(child.get("right"), state):
+   202→                        found = True
+   203→        if found:
+   204→            return True
+   205→        return any(node.kind in {"break", "continue", "return"} for node in tree)
+   206→
+   207→    def apply_transform(self, value: int | float, transform: tuple[str, int | float]) -> int | float:
+   208→        kind, constant = transform
+   209→        if kind == "complement":
+   210→            return constant - value
+   211→        if kind == "negate":
+   212→            return value - constant
+   213→        return int(constant) ^ int(value)
+   214→
+   215→    def eval_data(self, node: Node, state: Binding, value: int | float, env: dict[int, Any]) -> Any:
+   216→        if self.is_state(node, state):
+   217→            return value
+   218→        if node.kind == "number" or node.kind == "string" or node.kind == "bool":
+   219→            return node.get("value")
+   220→        if node.kind == "nil":
+   221→            return None
+   222→        if node.kind == "name":
+   223→            binding = binding_for(self.analyzer, node)
+   224→            if binding is not None and binding.ident in env:
+   225→                return env[binding.ident]
+   226→            if binding is not None and binding.ident in self.base_env:
+   227→                return self.base_env[binding.ident]
+   228→            return UNKNOWN
+   229→        if node.kind == "paren":
+   230→            return self.eval_data(node.get("expr"), state, value, env)
+   231→        if node.kind == "unop":
+   232→            inner = self.eval_data(node.get("expr"), state, value, env)
+   233→            if inner is UNKNOWN:
+   234→                return UNKNOWN
+   235→            if node.get("op") == "not":
+   236→                return not truthy(inner)
+   237→            if node.get("op") == "-":
+   238→                return -inner
+   239→            if node.get("op") == "#" and isinstance(inner, bytes):
+   240→                return len(inner)
+   241→            return UNKNOWN
+   242→        if node.kind == "binop":
+   243→            operator = node.get("op")
+   244→            if operator == "and":
+   245→                left = self.eval_data(node.get("left"), state, value, env)
+   246→                return self.eval_data(node.get("right"), state, value, env) if truthy(left) else left
+   247→            if operator == "or":
+   248→                left = self.eval_data(node.get("left"), state, value, env)
+   249→                return left if truthy(left) else self.eval_data(node.get("right"), state, value, env)
+   250→            left = self.eval_data(node.get("left"), state, value, env)
+   251→            right = self.eval_data(node.get("right"), state, value, env)
+   252→            if left is UNKNOWN or right is UNKNOWN:
+   253→                return UNKNOWN
+   254→            if operator == "..":
+   255→                return left + right if isinstance(left, bytes) and isinstance(right, bytes) else UNKNOWN
+   256→            if operator in {"==", "~=", "<", "<=", ">", ">="}:
+   257→                try:
+   258→                    if operator == "==":
+   259→                        return left == right
+   260→                    if operator == "~=":
+   261→                        return left != right
+   262→                    if operator == "<":
+   263→                        return left < right
+   264→                    if operator == "<=":
+   265→                        return left <= right
+   266→                    if operator == ">":
+   267→                        return left > right
+   268→                    return left >= right
+   269→                except (TypeError, ValueError):
+   270→                    return UNKNOWN
+   271→            return numeric_result(operator, left, right)
+   272→        if node.kind == "call":
+   273→            name = self.dotted_name(node.get("func"))
+   274→            args = [self.eval_data(argument, state, value, env) for argument in node.get("args", [])]
+   275→            return builtin_call(name, args)
+   276→        if node.kind == "ifexpr":
+   277→            condition = self.eval_data(node.get("cond"), state, value, env)
+   278→            if condition is UNKNOWN:
+   279→                return UNKNOWN
+   280→            if truthy(condition):
+   281→                return self.eval_data(node.get("then"), state, value, env)
+   282→            for branch_condition, branch_value in node.get("elifs", []):
+   283→                branch = self.eval_data(branch_condition, state, value, env)
+   284→                if branch is UNKNOWN:
+   285→                    return UNKNOWN
+   286→                if truthy(branch):
+   287→                    return self.eval_data(branch_value, state, value, env)
+   288→            return self.eval_data(node.get("else_"), state, value, env)
+   289→        return UNKNOWN
+   290→
+   291→    def eval_state(self, node: Node, state: Binding, value: int | float, env: dict[int, Any]) -> int | float:
+   292→        result = self.eval_data(node, state, value, env)
+   293→        if result is UNKNOWN or not is_number(result):
+   294→            raise DispatcherBail("dynamic state value")
+   295→        return result
+   296→
+   297→    def eval_condition(self, node: Node, state: Binding, value: int | float, env: dict[int, Any]) -> bool:
+   298→        result = self.eval_data(node, state, value, env)
+   299→        if result is UNKNOWN:
+   300→            raise DispatcherBail("dynamic dispatcher condition")
+   301→        return truthy(result)
+   302→
+   303→    def execute(self, statements: list[Node], state: Binding, value: int | float, conditions: list[tuple[Node, bool]], actions: list[Node], depth: int = 0, env: dict[int, Any] | None = None) -> list[DispatchPath]:
+   304→        self.work += 1
+   305→        if self.work > self.max_work:
+   306→            raise DispatcherBail("work limit")
+   307→        if depth > 100:
+   308→            raise DispatcherBail("dispatcher nesting limit")
+   309→        paths: list[DispatchPath] = []
+   310→        current_value = value
+   311→        current_conditions = list(conditions)
+   312→        current_actions = list(actions)
+   313→        current_env = dict(env or {})
+   314→        for statement_index, statement in enumerate(statements):
+   315→            kind = statement.kind
+   316→            if kind == "assign":
+   317→                targets = statement.get("targets", [])
+   318→                values = statement.get("values", [])
+   319→                state_targets = [target for target in targets if target.kind == "name" and binding_for(self.analyzer, target) is state]
+   320→                if state_targets:
+   321→                    if len(targets) != 1 or len(values) != 1:
+   322→                        raise DispatcherBail("state assignment mixed with other targets")
+   323→                    try:
+   324→                        current_value = self.eval_state(values[0], state, current_value, current_env)
+   325→                    except DispatcherBail:
+   326→                        if values[0].kind == "ifexpr":
+   327→                            return self.expand_state_ifexpr(values[0], statements, statement_index, state, current_value, current_conditions, current_actions, current_env, depth)
+   328→                        raise
+   329→                    continue
+   330→                if self.contains_state(statement, state):
+   331→                    raise DispatcherBail("state in payload assignment")
+   332→                if len(targets) == 1 and len(values) == 1 and targets[0].kind == "name":
+   333→                    target_binding = binding_for(self.analyzer, targets[0])
+   334→                    if target_binding is not None:
+   335→                        assigned = self.eval_data(values[0], state, current_value, current_env)
+   336→                        if assigned is UNKNOWN:
+   337→                            current_env.pop(target_binding.ident, None)
+   338→                        else:
+   339→                            current_env[target_binding.ident] = assigned
+   340→                current_actions.append(statement)
+   341→                continue
+   342→            if kind == "local":
+   343→                if any(name in statement.get("names", []) for name in [state.name]) or self.contains_state(statement, state):
+   344→                    raise DispatcherBail("state in local declaration")
+   345→                for local_binding, local_value in zip(self.analyzer.declaration_bindings.get(id(statement), []), statement.get("values", [])):
+   346→                    assigned = self.eval_data(local_value, state, current_value, current_env)
+   347→                    if assigned is UNKNOWN:
+   348→                        current_env.pop(local_binding.ident, None)
+   349→                    else:
+   350→                        current_env[local_binding.ident] = assigned
+   351→                current_actions.append(statement)
+   352→                continue
+   353→            if kind == "if":
+   354→                try:
+   355→                    condition_value = self.eval_condition(statement.get("cond"), state, current_value, current_env)
+   356→                except DispatcherBail:
+   357→                    if self.contains_state(statement.get("cond"), state):
+   358→                        raise
+   359→                    return self.fork_if(statement, state, current_value, current_conditions, current_actions, depth, current_env)
+   360→                if condition_value:
+   361→                    selected = statement.get("then", [])
+   362→                else:
+   363→                    selected = self.else_chain(statement)
+   364→                paths.extend(self.execute(selected, state, current_value, current_conditions, current_actions, depth + 1, current_env))
+   365→                return paths
+   366→            if kind == "do":
+   367→                paths.extend(self.execute(statement.get("body", []), state, current_value, current_conditions, current_actions, depth + 1, current_env))
+   368→                return paths
+   369→            if kind in {"while", "repeat", "fornum", "forin"}:
+   370→                if self.contains_state(statement, state):
+   371→                    raise DispatcherBail("state in nested loop")
+   372→                current_actions.append(statement)
+   373→                continue
+   374→            if kind in {"call", "methodcall"}:
+   375→                if self.contains_state(statement, state):
+   376→                    raise DispatcherBail("state in call")
+   377→                current_actions.append(statement)
+   378→                continue
+   379→            if kind == "return":
+   380→                if any(self.contains_state(value, state) for value in statement.get("values", [])):
+   381→                    raise DispatcherBail("state in return")
+   382→                paths.append(DispatchPath(current_conditions, current_actions, ("return", statement.get("values", [])), dict(current_env)))
+   383→                return paths
+   384→            if kind == "break":
+   385→                paths.append(DispatchPath(current_conditions, current_actions, ("break",), dict(current_env)))
+   386→                return paths
+   387→            if kind == "continue":
+   388→                paths.append(DispatchPath(current_conditions, current_actions, ("edge", current_value), dict(current_env)))
+   389→                return paths
+   390→            raise DispatcherBail("unsupported dispatcher statement " + kind)
+   391→        paths.append(DispatchPath(current_conditions, current_actions, ("edge", current_value), dict(current_env)))
+   392→        return paths
+   393→
+   394→    def expand_state_ifexpr(self, expression: Node, statements: list[Node], index: int, state: Binding, value: int | float, conditions: list[tuple[Node, bool]], actions: list[Node], env: dict[int, Any], depth: int) -> list[DispatchPath]:
+   395→        branches: list[tuple[Node | None, Node, list[tuple[Node, bool]]]] = []
+   396→        prior: list[tuple[Node, bool]] = []
+   397→        first_condition = expression.get("cond")
+   398→        branches.append((first_condition, expression.get("then"), prior + [(first_condition, True)]))
+   399→        prior = prior + [(first_condition, False)]
+   400→        for branch_condition, branch_value in expression.get("elifs", []):
+   401→            branches.append((branch_condition, branch_value, prior + [(branch_condition, True)]))
+   402→            prior = prior + [(branch_condition, False)]
+   403→        branches.append((None, expression.get("else_"), list(prior)))
+   404→        result: list[DispatchPath] = []
+   405→        for condition, leaf, branch_conditions in branches:
+   406→            if condition is None:
+   407→                selected: bool | None = True
+   408→            else:
+   409→                try:
+   410→                    selected = self.eval_condition(condition, state, value, env)
+   411→                except DispatcherBail:
+   412→                    selected = None
+   413→            if selected is False:
+   414→                continue
+   415→            branch_env = dict(env)
+   416→            try:
+   417→                leaf_value = self.eval_state(leaf, state, value, branch_env)
+   418→            except DispatcherBail:
+   419→                continue
+   420→            branch_path = list(conditions) + (branch_conditions if selected is None else [])
+   421→            result.extend(self.execute(statements[index + 1:], state, leaf_value, branch_path, list(actions), depth + 1, branch_env))
+   422→        return result
+   423→
+   424→    def else_chain(self, statement: Node) -> list[Node]:
+   425→        if not statement.get("elifs"):
+   426→            return statement.get("else_", [])
+   427→        condition, body = statement.get("elifs", [])[0]
+   428→        nested = Node("if", condition.start, condition.end, cond=condition, then=body, elifs=statement.get("elifs", [])[1:], else_=statement.get("else_", []))
+   429→        return [nested]
+   430→
+   431→    def fork_if(self, statement: Node, state: Binding, value: int | float, conditions: list[tuple[Node, bool]], actions: list[Node], depth: int, env: dict[int, Any] | None = None) -> list[DispatchPath]:
+   432→        condition = statement.get("cond")
+   433→        branch_env = dict(env or {})
+   434→        result: list[DispatchPath] = []
+   435→        result.extend(self.execute(statement.get("then", []), state, value, conditions + [(condition, True)], list(actions), depth + 1, branch_env))
+   436→        current = list(statement.get("elifs", []))
+   437→        prior = condition
+   438→        for branch_condition, branch_body in current:
+   439→            result.extend(self.execute(branch_body, state, value, conditions + [(prior, False), (branch_condition, True)], list(actions), depth + 1, branch_env))
+   440→            prior = branch_condition
+   441→        result.extend(self.execute(statement.get("else_", []), state, value, conditions + [(prior, False)], list(actions), depth + 1, branch_env))
+   442→        return result
+   443→
+   444→    def contains_state(self, node: Node | None, state: Binding) -> bool:
+   445→        if node is None:
+   446→            return False
+   447→        stack = [node]
+   448→        while stack:
+   449→            current = stack.pop()
+   450→            if current.kind == "name" and binding_for(self.analyzer, current) is state:
+   451→                return True
+   452→            for value in current.fields.values():
+   453→                if isinstance(value, Node):
+   454→                    stack.append(value)
+   455→                elif isinstance(value, (list, tuple)):
+   456→                    stack.extend(item for item in value if isinstance(item, Node))
+   457→                    for item in value:
+   458→                        if isinstance(item, (list, tuple)):
+   459→                            stack.extend(nested for nested in item if isinstance(nested, Node))
+   460→        return False
+   461→
+   462→    def recover(self, dispatcher: Dispatcher) -> Node | None:
+   463→        self.work = 0
+   464→        graph: dict[Any, list[DispatchPath]] = {}
+   465→        initial = self.apply_transform(dispatcher.initial, dispatcher.transform)
+   466→        queue: list[tuple[int | float, dict[int, Any]]] = [(initial, dict(self.base_env))]
+   467→        seen: dict[Any, dict[int, Any]] = {}
+   468→        while queue:
+   469→            value, incoming_env = queue.pop(0)
+   470→            key = self.key(value)
+   471→            if key in seen:
+   472→                if seen[key] != incoming_env:
+   473→                    raise DispatcherBail("state environment conflict")
+   474→                continue
+   475→            if len(seen) >= self.max_states:
+   476→                raise DispatcherBail("state limit")
+   477→            seen[key] = dict(incoming_env)
+   478→            paths = self.execute(dispatcher.tree, dispatcher.state, value, [], [], env=incoming_env)
+   479→            normalized: list[DispatchPath] = []
+   480→            for path in paths:
+   481→                if path.outcome[0] == "edge":
+   482→                    next_value = self.apply_transform(path.outcome[1], dispatcher.transform)
+   483→                    normalized.append(DispatchPath(path.conditions, path.actions, ("edge", next_value), path.env))
+   484→                    next_key = self.key(next_value)
+   485→                    if next_key not in seen:
+   486→                        queue.append((next_value, path.env))
+   487→                else:
+   488→                    normalized.append(path)
+   489→                if len(normalized) > self.max_paths:
+   490→                    raise DispatcherBail("path limit")
+   491→            graph[key] = normalized
+   492→        self.stats.dispatchers_found += 1
+   493→        self.stats.states_recovered += len(graph)
+   494→        statements: list[Node] | None = None
+   495→        try:
+   496→            statements = self.emit_state(initial, graph, set(), 0)
+   497→        except CycleHit:
+   498→            for header in graph:
+   499→                try:
+   500→                    statements = self.emit_state(initial, graph, set(), 0, loop_header=header)
+   501→                except CycleHit:
+   502→                    continue
+   503→                if statements is not None:
+   504→                    break
+   505→        if statements is None:
+   506→            raise DispatcherBail("cyclic or ambiguous graph")
+   507→        return Node("do", dispatcher.loop.start, dispatcher.loop.end, body=statements, states=len(graph))
+   508→
+   509→    def key(self, value: int | float) -> tuple[str, int | float]:
+   510→        if isinstance(value, float) and value.is_integer():
+   511→            value = int(value)
+   512→        return (type(value).__name__, value)
+   513→
+   514→    def emit_state(self, value: int | float, graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, loop_header: Any | None = None, in_loop: bool = False) -> list[Node] | None:
+   515→        if depth > self.max_paths:
+   516→            return None
+   517→        key = self.key(value)
+   518→        if key in stack:
+   519→            if loop_header is not None and key == loop_header and in_loop:
+   520→                return [Node("continue")]
+   521→            raise CycleHit(key)
+   522→        paths = graph.get(key)
+   523→        if not paths:
+   524→            return None
+   525→        next_stack = set(stack)
+   526→        next_stack.add(key)
+   527→        if loop_header is not None and key == loop_header and not in_loop:
+   528→            body = self.emit_paths(paths, graph, next_stack, depth + 1, True, loop_header)
+   529→            if body is None:
+   530→                return None
+   531→            return [Node("while", cond=Node("bool", value=True), body=body)]
+   532→        return self.emit_paths(paths, graph, next_stack, depth, in_loop, loop_header)
+   533→
+   534→    def emit_paths(self, paths: list[DispatchPath], graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None) -> list[Node] | None:
+   535→        if not paths:
+   536→            return []
+   537→        if len(paths) == 1 and not paths[0].conditions:
+   538→            return self.emit_path(paths[0], graph, stack, depth, in_loop, loop_header)
+   539→        unconditional = [path for path in paths if not path.conditions]
+   540→        conditional = [path for path in paths if path.conditions]
+   541→        if unconditional and conditional:
+   542→            condition = conditional[0].conditions[0][0]
+   543→            true_paths = [path for path in conditional if path.conditions[0][0] is condition and path.conditions[0][1]]
+   544→            false_paths = [path for path in conditional if path.conditions[0][0] is condition and not path.conditions[0][1]]
+   545→            if not true_paths and not false_paths:
+   546→                return None
+   547→            if not false_paths and len(unconditional) == 1:
+   548→                false_paths = unconditional
+   549→            if not true_paths or not false_paths or len(unconditional) > 1:
+   550→                return None
+   551→            true_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in true_paths]
+   552→            false_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in false_paths]
+   553→            then_body = self.emit_paths(true_paths, graph, set(stack), depth + 1, in_loop, loop_header)
+   554→            else_body = self.emit_paths(false_paths, graph, set(stack), depth + 1, in_loop, loop_header)
+   555→            if then_body is None or else_body is None:
+   556→                return None
+   557→            return [Node("if", condition.start, condition.end, cond=condition, then=then_body, elifs=[], else_=else_body)]
+   558→        condition = paths[0].conditions[0][0] if paths[0].conditions else None
+   559→        if condition is None:
+   560→            return None
+   561→        true_paths = [path for path in paths if path.conditions and path.conditions[0][0] is condition and path.conditions[0][1]]
+   562→        false_paths = [path for path in paths if path.conditions and path.conditions[0][0] is condition and not path.conditions[0][1]]
+   563→        if not true_paths or not false_paths:
+   564→            return None
+   565→        true_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in true_paths]
+   566→        false_paths = [DispatchPath(path.conditions[1:], path.actions, path.outcome, path.env) for path in false_paths]
+   567→        then_body = self.emit_paths(true_paths, graph, set(stack), depth + 1, in_loop, loop_header)
+   568→        else_body = self.emit_paths(false_paths, graph, set(stack), depth + 1, in_loop, loop_header)
+   569→        if then_body is None or else_body is None:
+   570→            return None
+   571→        return [Node("if", condition.start, condition.end, cond=condition, then=then_body, elifs=[], else_=else_body)]
+   572→
+   573→    def emit_path(self, path: DispatchPath, graph: dict[Any, list[DispatchPath]], stack: set[Any], depth: int, in_loop: bool = False, loop_header: Any | None = None) -> list[Node] | None:
+   574→        actions = [action.clone() for action in path.actions]
+   575→        if actions and any(action.kind in {"local", "localfunc"} for action in actions):
+   576→            actions = [Node("do", actions[0].start, actions[-1].end, body=actions)]
+   577→        outcome = path.outcome
+   578→        if outcome[0] == "break":
+   579→            if in_loop:
+   580→                actions.append(Node("break"))
+   581→            return actions
+   582→        if outcome[0] == "return":
+   583→            actions.append(Node("return", actions[-1].end if actions else 0, values=[value.clone() for value in outcome[1]]))
+   584→            return actions
+   585→        if outcome[0] != "edge":
+   586→            return None
+   587→        successor = self.emit_state(outcome[1], graph, stack, depth + 1, loop_header, in_loop)
+   588→        if successor is None:
+   589→            return None
+   590→        return actions + successor
+   591→
