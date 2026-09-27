@@ -55,6 +55,8 @@ class Pipeline:
 
     def run(self, source: str, aggressive: bool = True) -> tuple[str, RunReport]:
         started = time.monotonic()
+        from .junk import clear_verdict_cache
+        clear_verdict_cache()
         report = RunReport(input_bytes=len(source.encode("utf-8", "surrogateescape")))
         try:
             root, errors, comments = parse(source)

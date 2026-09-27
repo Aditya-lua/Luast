@@ -117,6 +117,8 @@ def numeric_result(op: str, left: Any, right: Any) -> Any:
         return math.fmod(left, right)
     if op == "^":
         try:
+            if abs(left) > 2 ** 53 or abs(right) > 64:
+                return UNKNOWN
             result = left ** right
         except (OverflowError, ValueError, ZeroDivisionError):
             return UNKNOWN
@@ -203,6 +205,20 @@ def bool_const(node: Node | None) -> bool | None:
     return None
 
 
+def _junk_truth(node: Node | None, base_eval: Callable[[Node], Any]) -> bool | None:
+    """Lazy proxy to luau_recover.junk.junk_truth (avoids import cycle)."""
+    if node is None:
+        return None
+    try:
+        from .junk import junk_truth
+    except ImportError:
+        return None
+    try:
+        return junk_truth(node, base_eval)
+    except Exception:
+        return None
+
+
 def evaluate(node: Node | None, env: dict[int, Any] | None = None, analyzer: Analyzer | None = None) -> Any:
     if node is None:
         return UNKNOWN
@@ -255,6 +271,10 @@ def evaluate(node: Node | None, env: dict[int, Any] | None = None, analyzer: Ana
         if operator in {"==", "~=", "<", "<=", ">", ">="} and (is_nan(left) or is_nan(right)):
             return operator == "~="
         if left is UNKNOWN or right is UNKNOWN:
+            if operator in {"==", "~=", "<", "<=", ">", ">="}:
+                folded = _junk_truth(node, lambda item: evaluate(item, env, analyzer))
+                if folded is not None:
+                    return folded
             return UNKNOWN
         if operator == "..":
             if isinstance(left, bytes) and isinstance(right, bytes):
@@ -658,30 +678,29 @@ def remove_unused_locals(root: Node, analyzer: Analyzer, stats: PassStats) -> No
                 values = statement.get("values", [])
                 for value in values:
                     process_functions(value)
-                if targets and len(targets) == len(values):
-                    dead_targets = []
-                    for target in targets:
+                # Dead store removal. An assignment is only removable when
+                # every target is provably unobservable: the binding's ONLY
+                # reads anywhere in its scope are inside the stored value
+                # itself (self-referential), and all values are pure. This
+                # preserves loop counters like `i = i + 1` (read again by the
+                # loop condition on the next iteration).
+                if targets and len(targets) == len(values) and all(is_pure(value) for value in values):
+                    all_dead_targets = True
+                    for target, value in zip(targets, values):
                         if target.kind != "name":
-                            dead_targets = []
+                            all_dead_targets = False
                             break
                         binding = binding_for(analyzer, target)
                         if binding is None:
-                            dead_targets = []
+                            all_dead_targets = False
                             break
-                        dead_targets.append(binding)
-                    if dead_targets and all(is_pure(value) for value in values):
-                        stats.dead_locals += len(dead_targets)
+                        internal_reads = sum(1 for node in walk(value) if node.kind == "name" and binding_for(analyzer, node) is binding)
+                        if binding.reads != internal_reads:
+                            all_dead_targets = False
+                            break
+                    if all_dead_targets:
+                        stats.dead_locals += len(targets)
                         continue
-                    # Self-referential dead store: `X = {.. X ..}` where the
-                    # only reads of X anywhere are inside the stored value
-                    # itself. Nothing can ever observe the store.
-                    if len(targets) == 1 and targets[0].kind == "name" and is_pure(values[0]):
-                        binding = binding_for(analyzer, targets[0])
-                        if binding is not None and binding.writes >= 1:
-                            internal_reads = sum(1 for node in iter_nodes(values[0]) if isinstance(node, Node) and node.kind == "name" and binding_for(analyzer, node) is binding)
-                            if binding.reads == internal_reads:
-                                stats.dead_locals += 1
-                                continue
             elif kind == "do":
                 statement.fields["body"] = process(statement.get("body", []))
                 if not statement.get("body", []):
@@ -1523,7 +1542,17 @@ class PoolResolver:
                 if numeric_kind(left) != numeric_kind(right) and not (is_number(left) and is_number(right)):
                     return UNKNOWN
                 try:
-                    return {"==": left == right, "~=": left != right, "<": left < right, "<=": left <= right, ">": left > right, ">=": left >= right}[operator]
+                    if operator == "==":
+                        return left == right
+                    if operator == "~=":
+                        return left != right
+                    if operator == "<":
+                        return left < right
+                    if operator == "<=":
+                        return left <= right
+                    if operator == ">":
+                        return left > right
+                    return left >= right
                 except (TypeError, ValueError):
                     return UNKNOWN
             return numeric_result(operator, left, right)

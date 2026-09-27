@@ -1,0 +1,53 @@
+[
+  {
+    "name": "CollectTheAlphabet.luau",
+    "input_bytes": 0,
+    "elapsed": 13.9,
+    "status": "ok",
+    "output_bytes": 560174,
+    "dispatchers_found": 114,
+    "dispatchers_removed": 110,
+    "states_recovered": 1389,
+    "pool_values": 3516,
+    "rolled_back": [],
+    "lines": 12732,
+    "while_true_count": 18,
+    "continue_count": 338,
+    "pool_table_lines": 0,
+    "var_reads": 470
+  },
+  {
+    "name": "Karinderya.luau",
+    "input_bytes": 0,
+    "elapsed": 132.5,
+    "status": "ok",
+    "output_bytes": 6273255,
+    "dispatchers_found": 334,
+    "dispatchers_removed": 318,
+    "states_recovered": 3612,
+    "pool_values": 8281,
+    "rolled_back": [],
+    "lines": 98381,
+    "while_true_count": 125,
+    "continue_count": 1658,
+    "pool_table_lines": 0,
+    "var_reads": 4122
+  },
+  {
+    "name": "SpinjitsuEscape.lua",
+    "input_bytes": 0,
+    "elapsed": 38.2,
+    "status": "ok",
+    "output_bytes": 2088648,
+    "dispatchers_found": 98,
+    "dispatchers_removed": 96,
+    "states_recovered": 1635,
+    "pool_values": 4210,
+    "rolled_back": [],
+    "lines": 34231,
+    "while_true_count": 47,
+    "continue_count": 516,
+    "pool_table_lines": 0,
+    "var_reads": 1635
+  }
+]

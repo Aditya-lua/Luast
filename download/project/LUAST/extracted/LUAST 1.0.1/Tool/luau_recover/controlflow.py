@@ -14,6 +14,20 @@ class StateSubstitutionError(Exception):
     pass
 
 
+def _junk_truth(node: Node | None, base_eval) -> bool | None:
+    """Lazy proxy to luau_recover.junk.junk_truth (avoids import cycle)."""
+    if node is None:
+        return None
+    try:
+        from .junk import junk_truth
+    except ImportError:
+        return None
+    try:
+        return junk_truth(node, base_eval)
+    except Exception:
+        return None
+
+
 @dataclass
 class DispatchPath:
     conditions: list[tuple[Node, bool]]
@@ -55,6 +69,7 @@ class DispatcherPass:
         self.emit_budget = 40000
         self.work = 0
         self.base_env = constant_environment(analyzer)
+        self.bailed: set[int] = set()
 
     def apply(self, rounds: int = 8) -> int:
         completed = 0
@@ -67,6 +82,8 @@ class DispatcherPass:
                 for index, statement in enumerate(statements):
                     if statement.kind != "while":
                         continue
+                    if id(statement) in self.bailed:
+                        continue
                     candidate = self.recognize(statements, index, statement)
                     if candidate is not None:
                         candidates.append(candidate)
@@ -75,10 +92,13 @@ class DispatcherPass:
                 try:
                     replacement = self.recover(candidate)
                 except DispatcherBail:
+                    self.bailed.add(id(candidate.loop))
                     continue
                 except (RecursionError, OverflowError, ValueError, TypeError):
+                    self.bailed.add(id(candidate.loop))
                     continue
                 if replacement is None:
+                    self.bailed.add(id(candidate.loop))
                     continue
                 candidate.statements[candidate.index] = replacement
                 self.stats.dispatchers_removed += 1
@@ -112,31 +132,103 @@ class DispatcherPass:
         if not body:
             return None
         head = body[0]
-        if head.kind != "assign" or len(head.get("targets", [])) != 1 or len(head.get("values", [])) != 1:
-            return None
-        target = head.get("targets", [])[0]
-        if target.kind != "name":
-            return None
-        state = binding_for(self.analyzer, target)
+        state = None
+        transform: tuple[str, int | float] = ("identity", 0)
+        tree = body
+        if head.kind == "assign" and len(head.get("targets", [])) == 1 and len(head.get("values", [])) == 1:
+            target = head.get("targets", [])[0]
+            if target.kind == "name":
+                candidate = binding_for(self.analyzer, target)
+                if candidate is not None:
+                    found = self.transition(head.get("values", [])[0], candidate)
+                    if found is not None:
+                        state = candidate
+                        transform = found
+                        tree = body[1:]
         if state is None:
-            return None
-        transform = self.transition(head.get("values", [])[0], state)
-        if transform is None:
-            return None
+            # Style B: no loop-top transform; the state variable is dispatched
+            # directly (`while true do if s < K then ... end end`) and its
+            # initial value comes from an earlier assignment (often a resolved
+            # pool read). Infer the variable from the dispatch comparisons.
+            state = self.infer_state_var(body)
+            if state is None:
+                return None
         initial = self.initial_value(statements, index, state)
         if initial is None:
             return None
-        tree = body[1:]
         if len(tree) == 1 and tree[0].kind == "do":
             tree = tree[0].get("body", [])
         if not self.looks_like_dispatch(tree, state):
             return None
         return Dispatcher(loop, statements, index, state, initial, transform, tree)
 
+    def infer_state_var(self, tree: list[Node]) -> Binding | None:
+        """Find the dispatcher state variable for transform-less loops.
+
+        Candidates are plain locals compared against number literals inside
+        the tree that also receive assignments within it. The candidate with
+        the most comparisons wins; ties prefer the one assigned most often.
+        Ordinary `while true` loops without a numeric dispatch pattern are
+        rejected here, so they are never mistaken for dispatchers."""
+        comparisons: dict[int, tuple[Binding, int]] = {}
+        assignments: dict[int, int] = {}
+
+        def visit(node: Node) -> None:
+            if node.kind == "binop" and node.get("op") in {"<", "<=", ">", ">=", "==", "~="}:
+                for side in (node.get("left"), node.get("right")):
+                    if isinstance(side, Node) and side.kind == "name":
+                        binding = binding_for(self.analyzer, side)
+                        if binding is not None:
+                            ident = binding.ident
+                            entry = comparisons.get(ident)
+                            if entry is None:
+                                comparisons[ident] = (binding, 1)
+                            else:
+                                comparisons[ident] = (binding, entry[1] + 1)
+            elif node.kind == "assign":
+                for value in node.get("values", []):
+                    if isinstance(value, Node) and value.kind in {"number", "ifexpr"}:
+                        for target in node.get("targets", []):
+                            if isinstance(target, Node) and target.kind == "name":
+                                binding = binding_for(self.analyzer, target)
+                                if binding is not None:
+                                    assignments[binding.ident] = assignments.get(binding.ident, 0) + 1
+            elif node.kind == "if":
+                for value in (node.get("cond"),):
+                    if isinstance(value, Node) and value.kind == "ifexpr":
+                        pass
+            elif node.kind in {"function", "localfunc"}:
+                return
+            for value in node.fields.values():
+                if isinstance(value, Node):
+                    visit(value)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, Node):
+                            visit(item)
+
+        for statement in tree:
+            visit(statement)
+        best: Binding | None = None
+        best_score: tuple[int, int] = (0, 0)
+        for ident, (binding, count) in comparisons.items():
+            assigned = assignments.get(ident, 0)
+            if assigned == 0:
+                continue
+            score = (count, assigned)
+            if score > best_score:
+                best_score = score
+                best = binding
+        return best
+
     def is_true(self, node: Node) -> bool:
         return isinstance(node, Node) and node.kind == "bool" and node.get("value") is True
 
     def transition(self, expression: Node, state: Binding) -> tuple[str, int | float] | None:
+        if expression.kind == "paren":
+            inner = expression.get("expr")
+            if isinstance(inner, Node):
+                return self.transition(inner, state)
         if expression.kind == "binop" and expression.get("op") == "-":
             left = expression.get("left")
             right = expression.get("right")
@@ -213,6 +305,8 @@ class DispatcherPass:
 
     def apply_transform(self, value: int | float, transform: tuple[str, int | float]) -> int | float:
         kind, constant = transform
+        if kind == "identity":
+            return value
         if kind == "complement":
             return constant - value
         if kind == "negate":
@@ -265,6 +359,10 @@ class DispatcherPass:
                 return left if truthy(left) else self.eval_data(node.get("right"), state, value, env)
             left = self.eval_data(node.get("left"), state, value, env)
             right = self.eval_data(node.get("right"), state, value, env)
+            if operator in {"==", "~=", "<", "<=", ">", ">="} and (left is UNKNOWN or right is UNKNOWN):
+                folded = _junk_truth(node, lambda item: self.eval_data(item, state, value, env))
+                if folded is not None:
+                    return folded
             if left is UNKNOWN or right is UNKNOWN:
                 return UNKNOWN
             if operator == "..":
@@ -368,12 +466,18 @@ class DispatcherPass:
                 if state_targets:
                     if len(targets) != 1 or len(values) != 1:
                         raise DispatcherBail("state assignment mixed with other targets")
-                    try:
-                        current_value = self.eval_state(values[0], state, current_value, current_env)
-                    except DispatcherBail:
+                    evaluated = self.eval_data(values[0], state, current_value, current_env)
+                    if evaluated is UNKNOWN or not is_number(evaluated):
                         if values[0].kind == "ifexpr":
                             return self.expand_state_ifexpr(values[0], statements, statement_index, state, current_value, current_conditions, current_actions, current_env, depth)
-                        raise
+                        if evaluated is UNKNOWN:
+                            raise DispatcherBail("dynamic state value")
+                        # Non-number sentinel (LUAST junk transition, e.g.
+                        # `s = "hwid"`): the dispatch cannot continue, so the
+                        # path dead-ends instead of killing the recovery.
+                        paths.append(DispatchPath(current_conditions, current_actions, ("dead",), dict(current_env)))
+                        return paths
+                    current_value = evaluated
                     continue
                 if self.contains_state(statement, state):
                     try:
@@ -505,10 +609,11 @@ class DispatcherPass:
                 # state unchanged; treat it as an edge to the same state.
                 leaf_value = value
             else:
-                try:
-                    leaf_value = self.eval_state(leaf, state, value, branch_env)
-                except DispatcherBail:
+                leaf_eval = self.eval_data(leaf, state, value, branch_env)
+                if leaf_eval is UNKNOWN or not is_number(leaf_eval):
+                    # Non-number leaf: junk transition, drop this branch.
                     continue
+                leaf_value = leaf_eval
             branch_path = list(conditions) + (branch_conditions if selected is None else [])
             result.extend(self.execute(statements[index + 1:], state, leaf_value, branch_path, list(actions), depth + 1, branch_env))
         return result
@@ -685,6 +790,8 @@ class DispatcherPass:
         if actions and any(action.kind in {"local", "localfunc"} for action in actions):
             actions = [Node("do", actions[0].start, actions[-1].end, body=actions)]
         outcome = path.outcome
+        if outcome[0] == "dead":
+            return actions
         if outcome[0] == "break":
             if in_loop:
                 actions.append(Node("break"))
