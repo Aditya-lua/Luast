@@ -666,12 +666,13 @@ def index_datatype(obj, key: bytes):
     """Member lookup for the shim datatypes; returns (found, value)."""
     if isinstance(key, str):
         key = key.encode("latin-1", "ignore")
+    ks = key.decode("latin-1", "ignore")
 
     for cls, members in DATATYPE_MEMBERS.items():
         if isinstance(obj, cls):
-            if key not in members:
+            if ks not in members:
                 return False, None
-            attr = members[key]
+            attr = members[ks]
             if attr is None:
                 return True, NIL
             v = getattr(obj, attr)

@@ -1,9 +1,0 @@
-LUAST L3 emulation report
-input: /home/z/my-project/scratch/work/obf_level3_compact.luau
-state var=cL K=13083 init=6
-
-== state trace (state, Z at dispatch) ==
-
-== print outputs ==
-
-

@@ -14,17 +14,36 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
 from . import lua_rt as _luart
 from .lua_rt import (  # noqa: E402
     NIL, LuaTable, LuaError, ContinueSignal, BreakSignal, ReturnSignal,
-    Instance, Buffer, V2Value, EnumItem, EnumType, EnumRoot, PyFunc,
-    LuaClosure, Userdata, truthy, first, fmt_num, lua_tostr, typeof,
-    type_desc, need_num, MUTLOG, build_globals,
+    Instance, Buffer, V2Value, Vec3, ColorVal, VecLib, EnumItem, EnumType,
+    EnumRoot, PyFunc, LuaClosure, Userdata, RobloxDummy, NilChain,
+    FuncLikeDummy, truthy, first, fmt_num, lua_tostr, typeof, type_desc,
+    need_num, MUTLOG, build_globals,
 )
 from .parser import parse  # noqa: E402
+from .model import Node  # noqa: E402
+from . import roblox_shims as _rbs  # f32-exact Roblox datatypes  # noqa: E402
+
+_RBS_TYPES = None
+
+
+def _rbs_known_type(v):
+    """True if v is one of the f32-exact roblox_shims datatypes."""
+    global _RBS_TYPES
+    if _RBS_TYPES is None:
+        _RBS_TYPES = (_rbs.Vector3, _rbs.Vector2, _rbs.UDim, _rbs.UDim2,
+                      _rbs.Color3, _rbs.CFrame, _rbs.NumberRange,
+                      _rbs.NumberSequenceKeypoint, _rbs.ColorSequenceKeypoint,
+                      _rbs.NumberSequence, _rbs.ColorSequence, _rbs.Rect,
+                      _rbs.Ray, _rbs.Faces, _rbs.Axes, _rbs.TweenInfo,
+                      _rbs.Random)
+    return isinstance(v, _RBS_TYPES)
 
 MAX_LOOP_ITERS = 200000
 MAX_TOTAL_STEPS = 2000000
@@ -51,6 +70,7 @@ class Interp:
         self.services = {}
         self.globals_env = Env(None)
         self.globals_env.vars = build_globals(self)
+        self._src_lines = None   # newline offsets for debug.info 'l' lookups
         self.outputs = []          # captured print payloads (bytes)
         self.calllog = []          # (name, brief-args) for every builtin/closure call
         self.steps = 0
@@ -63,6 +83,23 @@ class Interp:
         self.obs_fromstring = []   # buffer.fromstring args (bytes)
         self.obs_readstring = []   # (offset, n) args of buffer.readstring
         self.obs_round_calls = []  # (closure_node, arg, result) single-number closure calls
+        # self-healing: Z-drift correction applied to (state + Z) seeds
+        self.z_correction = 0.0
+        self.z_var_name = None
+        self.last_seed_obs = None  # (state_val, z_val, raw_result) pre-correction
+        self.byte_obs = []         # raw bytes seen by string.byte (cipher capture)
+
+    def set_source(self, src: str):
+        """Record source newline offsets so debug.info(f,'l') can report
+        1-based LINE numbers exactly like the real Luau VM."""
+        import bisect
+        self._src_lines = [i for i, ch in enumerate(src) if ch == "\n"]
+
+    def line_of(self, pos: int) -> float:
+        if self._src_lines is None:
+            return -1.0
+        import bisect
+        return float(bisect.bisect_right(self._src_lines, pos) + 1)
 
     # ------------------------------------------------------------- calling
 
@@ -70,8 +107,22 @@ class Interp:
         self.steps += 1
         if self.steps > MAX_TOTAL_STEPS:
             raise LuaError("emulation step limit exceeded")
+        if isinstance(f, VecLib):
+            # vector(x, y, z) direct call -> f32-exact vector
+            self.calllog.append(("vector", [brief(a) for a in args]))
+            xs = []
+            for i in range(3):
+                xs.append(need_num(args[i]) if i < len(args) else 0.0)
+            return [_rbs.Vector3(xs[0], xs[1], xs[2])]
+        if isinstance(f, RobloxDummy):
+            # calling a decoy Roblox global yields another dummy value
+            self.calllog.append((f.name, [brief(a) for a in args]))
+            return [f]
         if isinstance(f, PyFunc):
             self.calllog.append((f.name, [brief(a) for a in args]))
+            if f.name == "string.byte" and args and isinstance(args[0], bytes) \
+                    and 4 <= len(args[0]) <= 64:
+                self.byte_obs.append(args[0])
             if f.name == "buffer.fromstring" and args and isinstance(args[0], bytes):
                 self.obs_fromstring.append(args[0])
             if f.name == "buffer.readstring" and len(args) >= 3:
@@ -237,7 +288,52 @@ class Interp:
                     break
                 i += step
         elif k == "forin":
-            raise LuaError("generic for not supported by emulator")
+            names = st.get("names") or st.get("vars") or []
+            vals = self.eval_list(st.get("iterators", []), env)
+            env_f = Env(env)
+            if len(vals) >= 4 and vals[0] == "__pyiter__":
+                # Python-side iterator protocol: [marker, fn, state, ctrl]
+                _mk, ffn, fstate, fctrl = vals[0], vals[1], vals[2], vals[3]
+                ctrl = fctrl
+                iters = 0
+                while True:
+                    iters += 1
+                    if iters > MAX_LOOP_ITERS:
+                        raise LuaError("forin iteration limit exceeded")
+                    row = ffn(fstate, ctrl)
+                    if not row:
+                        break
+                    ctrl = row[0]
+                    for vi, nm in enumerate(names):
+                        env_f.vars[nm] = row[vi] if vi < len(row) else NIL
+                    try:
+                        self.exec_stmts(st.get("body", []), Env(env_f))
+                    except ContinueSignal:
+                        pass
+                    except BreakSignal:
+                        break
+            else:
+                f = vals[0] if vals else NIL
+                state = vals[1] if len(vals) > 1 else NIL
+                ctrl = vals[2] if len(vals) > 2 else NIL
+                iters = 0
+                while True:
+                    iters += 1
+                    if iters > MAX_LOOP_ITERS:
+                        raise LuaError("forin iteration limit exceeded")
+                    row = self.call_function(f, [state, ctrl])
+                    first_v = row[0] if row else NIL
+                    if first_v is NIL or first_v is None:
+                        break
+                    ctrl = first_v
+                    for vi, nm in enumerate(names):
+                        env_f.vars[nm] = row[vi] if vi < len(row) else NIL
+                    try:
+                        self.exec_stmts(st.get("body", []), Env(env_f))
+                    except ContinueSignal:
+                        pass
+                    except BreakSignal:
+                        break
         elif k == "do":
             self.exec_stmts(st.get("body", []), Env(env))
         elif k == "return":
@@ -296,8 +392,12 @@ class Interp:
                 return self.globals_env.vars[name]
             if name not in self.unknown_globals:
                 self.unknown_globals.add(name)
-                self.warnings.append("unknown global read: %s (-> nil)" % name)
-            return NIL
+                self.warnings.append(
+                    "unknown global read: %s (-> falsy chainable)" % name)
+            # Unknown globals are nil on Roblox (falsy) — but decoy code may
+            # still index/call them with pool keys, so hand out a NilChain
+            # instead of NIL to keep emulation alive.
+            return NilChain(name)
         if k == "index":
             obj = first(self.eval(e.get("obj"), env))
             key = first(self.eval(e.get("key"), env))
@@ -316,6 +416,27 @@ class Interp:
             return self.call_function(meth, [obj] + args)
         if k == "binop":
             op = e.get("op")
+            # seed-pattern detection: (state + Z) — the keystream seed.  When
+            # self-healing discovered a Z correction, apply it exactly here.
+            if op == "+" and self.dispatch_var and self.z_var_name:
+                le, re_ = e.get("left"), e.get("right")
+                if le is not None and le.kind == "name" \
+                        and re_ is not None and re_.kind == "name":
+                    ln, rn = le.get("name"), re_.get("name")
+                    if {ln, rn} == {self.dispatch_var, self.z_var_name}:
+                        a = first(self.eval(le, env))
+                        b = first(self.eval(re_, env))
+                        try:
+                            raw = arith("+", a, b)
+                            self.last_seed_obs = (a, b, raw)
+                        except LuaError:
+                            raw = None
+                        if self.z_correction:
+                            try:
+                                return arith("+", a, b) + self.z_correction
+                            except LuaError:
+                                pass
+                        return raw if raw is not None else binop("+", a, b)
             left = first(self.eval(e.get("left"), env))
             if op == "and":
                 return left if not truthy(left) else first(self.eval(e.get("right"), env))
@@ -416,18 +537,70 @@ def lu_index(obj, key):
     if isinstance(key, (int, float)) and not isinstance(key, bool):
         key = float(key)
     if isinstance(obj, LuaTable):
-        return obj.get(key)
+        v = obj.get(key)
+        if v is NIL and getattr(obj, "lib", False) and isinstance(key, bytes):
+            # standard-library decoy member (e.g. coroutine.flags):
+            # function-like dummy keeps emulation alive
+            return FuncLikeDummy("%s.%s" % (obj.__repr__().split(':')[0], key.decode("latin-1")))
+        return v
     if isinstance(obj, bytes):
         if isinstance(key, bytes):
             return string_lib_lookup(key)
         return NIL
     if isinstance(obj, Instance):
-        return obj.props.get(key, NIL)
+        v = obj.props.get(key, NIL)
+        if v is NIL and isinstance(key, bytes):
+            # missing instance method (e.g. decoy GetChildren call):
+            # function-like dummy keeps emulation alive
+            return FuncLikeDummy("%s.%s" % (obj.cls, key.decode("latin-1")))
+        return v
     if isinstance(obj, V2Value):
         if key == b"X":
             return obj.x
         if key == b"Y":
             return obj.y
+        return NIL
+    if isinstance(obj, Vec3):
+        if key in (b"X", b"x"):
+            return obj.x
+        if key in (b"Y", b"y"):
+            return obj.y
+        if key in (b"Z", b"z"):
+            return obj.z
+        if key == b"Magnitude":
+            return math.sqrt(obj.x * obj.x + obj.y * obj.y + obj.z * obj.z)
+        if key == b"Unit":
+            m = math.sqrt(obj.x * obj.x + obj.y * obj.y + obj.z * obj.z) or 1.0
+            return Vec3(obj.x / m, obj.y / m, obj.z / m)
+        return NIL
+    if isinstance(obj, ColorVal):
+        if key in (b"R", b"r"):
+            return obj.r
+        if key in (b"G", b"g"):
+            return obj.g
+        if key in (b"B", b"b"):
+            return obj.b
+        return NIL
+    if isinstance(obj, VecLib):
+        # vector.create / .floor / .ceil / ... -> f32-exact member table
+        tbl = getattr(obj, "members", None)
+        if tbl is not None:
+            v = tbl.get(key)
+            if v is not NIL:
+                return v
+        return PyFunc(lambda x=0.0, y=0.0, z=0.0: _rbs.Vector3(x, y, z),
+                      "vector.create")
+    # f32-exact datatype property access (Vector3/Vector2/CFrame/Color3/...)
+    found, dval = _rbs.index_datatype(obj, key)
+    if found:
+        return dval
+    if _rbs_known_type(obj):
+        # method access on a datatype (obj:Dot(...), obj:Lerp(...), ...)
+        if isinstance(key, bytes):
+            mname = key
+            return PyFunc(
+                lambda *a, _o=obj, _n=mname: _rbs.call_datatype_method(_o, _n, list(a))[1],
+                "method.%s" % key.decode("latin-1", "ignore"))
         return NIL
     if isinstance(obj, EnumRoot):
         return obj.types.get(key.decode() if isinstance(key, bytes) else key, NIL)
@@ -444,6 +617,8 @@ def lu_index(obj, key):
         if key == b"EnumType":
             return obj.etype.encode()
         return NIL
+    if isinstance(obj, RobloxDummy):
+        return obj  # chainable dummy: .new / .fromName / ... -> dummy
     if obj is NIL:
         raise LuaError("attempt to index nil with '%s'"
                        % (key.decode("latin-1") if isinstance(key, bytes) else str(key)))
@@ -462,6 +637,14 @@ def lu_setindex(obj, key, v):
 
 
 def arith(op, a, b):
+    # f32-exact datatype arithmetic (Vector3/Vector2/int16 wrap) first
+    rv = _rbs.arith_vector(op, a, b)
+    if rv is not None:
+        return rv
+    if isinstance(a, _rbs.CFrame) or isinstance(b, _rbs.CFrame):
+        if op == "*":
+            return _rbs.cframe_mul_components(a, b)
+        raise LuaError("unsupported CFrame op '%s'" % op)
     if isinstance(a, V2Value) or isinstance(b, V2Value):
         # Vector2int16 arithmetic (componentwise); scalar operand allowed
         ax, ay = (a.x, a.y) if isinstance(a, V2Value) else (need_num(a), need_num(a))
@@ -473,7 +656,36 @@ def arith(op, a, b):
         if op == "*":
             return V2Value(ax * bx, ay * by)
         if op == "/":
-            return V2Value(ax / bx, ay / by)
+            def _d(p, q):
+                try:
+                    return p / q
+                except ZeroDivisionError:
+                    if p == 0 or p != p:
+                        return float("nan")
+                    return math.copysign(float("inf"), p) * math.copysign(1.0, q)
+            return V2Value(_d(ax, bx), _d(ay, by))
+        raise LuaError("unsupported vector op '%s'" % op)
+    if isinstance(a, Vec3) or isinstance(b, Vec3):
+        # vector arithmetic (componentwise); scalar operand allowed
+        ax, ay, az = (a.x, a.y, a.z) if isinstance(a, Vec3) else (
+            need_num(a), need_num(a), need_num(a))
+        bx, by, bz = (b.x, b.y, b.z) if isinstance(b, Vec3) else (
+            need_num(b), need_num(b), need_num(b))
+        if op == "+":
+            return Vec3(ax + bx, ay + by, az + bz)
+        if op == "-":
+            return Vec3(ax - bx, ay - by, az - bz)
+        if op == "*":
+            return Vec3(ax * bx, ay * by, az * bz)
+        if op == "/":
+            def _d(p, q):
+                try:
+                    return p / q
+                except ZeroDivisionError:
+                    if p == 0 or p != p:
+                        return float("nan")
+                    return math.copysign(float("inf"), p) * math.copysign(1.0, q)
+            return Vec3(_d(ax, bx), _d(ay, by), _d(az, bz))
         raise LuaError("unsupported vector op '%s'" % op)
     if op == "..":
         return lua_tostr(a) + lua_tostr(b)
@@ -486,11 +698,26 @@ def arith(op, a, b):
     if op == "*":
         return x * y
     if op == "/":
-        return x / y
+        # Luau: 1/0 = inf, -1/0 = -inf, 0/0 = nan (IEEE754)
+        try:
+            return x / y
+        except ZeroDivisionError:
+            if x == 0 or x != x:
+                return float("nan")
+            return math.copysign(float("inf"), x) * math.copysign(1.0, y)
     if op == "%":
-        return x % y  # python % == lua % for our domain (sign of divisor)
+        # Luau: x % 0 = nan; python % == lua % for our domain (sign of divisor)
+        if y == 0:
+            return float("nan")
+        return x % y
     if op == "^":
-        return float(math.pow(x, y))
+        try:
+            return float(math.pow(x, y))
+        except (ValueError, OverflowError):
+            # 0^negative -> inf; overflow -> inf (Luau/IEEE754)
+            if x == 0:
+                return float("inf")
+            return float("inf")
     raise LuaError("unsupported arith op '%s'" % op)
 
 
@@ -886,6 +1113,196 @@ def recover_payload(cipher, ap, round_steps, ae_state, verbose=True, z_shim=None
     return results
 
 
+def find_z_var_name(root, d):
+    """The Z accumulator: first `+=` target inside the dispatcher body."""
+    zvar = None
+
+    def _find(node):
+        nonlocal zvar
+        if isinstance(node, Node):
+            if node.kind == "assign" and node.get("op") == "+=":
+                ts = node.get("targets", [])
+                if ts and ts[0].kind == "name":
+                    zvar = ts[0].get("name")
+                    return True
+            for v in node.fields.values():
+                if _find(v):
+                    return True
+        elif isinstance(node, list):
+            for v in node:
+                if _find(v):
+                    return True
+        return False
+
+    if d is not None:
+        for st in d["node"].get("body", []):
+            if _find(st):
+                break
+    return zvar
+
+
+# known-plaintext dictionary: decoded keys are library member names
+_KEY_PLAINTEXTS = (
+    b"rep", b"sub", b"len", b"new", b"abs", b"byte", b"char", b"find",
+    b"band", b"bxor", b"bor", b"info", b"floor", b"sign", b"concat",
+    b"match", b"gsub", b"ceil", b"max", b"min", b"readu32", b"readu8",
+    b"writeu32", b"writeu8", b"fromstring", b"readstring", b"lrotate",
+    b"rrotate", b"lshift", b"rshift", b"resume", b"create", b"yield",
+    b"format", b"gmatch", b"upper", b"lower", b"reverse", b"insert",
+    b"remove", b"isfrozen", b"GetService", b"graphemes", b"offset",
+)
+
+_M31 = 2147483647
+_M31M1 = 2147483646
+_M32 = 4294967296
+_M32C = 0xFFFFFFFF
+_INV16807 = pow(16807, -1, _M31)
+
+
+def _inv_rs(y, p):
+    x = 0
+    for i in range(31, -1, -1):
+        hi = ((x >> (i + p)) & 1) if i + p < 32 else 0
+        x |= (((y >> i) & 1) ^ hi) << i
+    return x
+
+
+def _inv_ls(y, p):
+    x = 0
+    for i in range(32):
+        lo = ((x >> (i - p)) & 1) if i >= p else 0
+        x |= (((y >> i) & 1) ^ lo) << i
+    return x
+
+
+def _make_round_inv(steps):
+    def inv(x):
+        x = int(x) & _M32C
+        for kind, p in reversed(steps):
+            if kind == "add":
+                x = (x - p) & _M32C
+            elif kind == "rs":
+                x = _inv_rs(x, p)
+            elif kind == "ls":
+                x = _inv_ls(x, p)
+            elif kind == "rot":
+                x = ((x >> p) | (x << (32 - p))) & _M32C
+        return x
+    return inv
+
+
+def solve_z_correction(interp, state_val=None, z_val=None):
+    """Recover candidate true (state + Z) seeds from known plaintexts.
+
+    Returns a list of candidate Z corrections, most plausible first."""
+    seed_raw = interp.last_seed_obs
+    if seed_raw is None:
+        return []
+    state_val = float(seed_raw[0])
+    z_val = float(seed_raw[1])
+
+    # candidate ciphers: raw bytes seen by string.byte (most recent first)
+    ciphers = []
+    if interp.byte_obs:
+        ciphers.append(interp.byte_obs[-1])  # the failing decode's cipher
+    for b in reversed(interp.byte_obs[-64:]):
+        if b not in ciphers:
+            ciphers.append(b)
+        if len(ciphers) >= 4:
+            break
+    if not ciphers:
+        return []
+
+    return _vote_correction(interp, ciphers, state_val, z_val)
+
+
+def _vote_correction(interp, ciphers, state_val, z_val):
+    # locate the round steps used by obs (re-derive from obs_round_calls)
+    steps = None
+    for node, arg, result, _st in interp.obs_round_calls:
+        steps = extract_round_steps(node)
+        if steps:
+            break
+    if not steps:
+        return None
+    rnd = make_round(steps)
+    if isinstance(rnd, tuple):
+        rnd = rnd[0]
+    aa_inv = _make_round_inv(steps)
+
+    from collections import Counter
+    votes = Counter()
+    for cipher in ciphers:
+        n_total = len(cipher)
+        for offset in range(1, min(n_total - 2, 20)):
+            for target in _KEY_PLAINTEXTS:
+                n = len(target)
+                if offset + n > n_total:
+                    continue
+                if n not in (3, 4):
+                    continue
+                ct = cipher[offset:offset + n]
+                ks = [ct[i] ^ target[i] for i in range(n)]
+                if n == 3:
+                    AX24 = ks[0] | (ks[1] << 8) | (ks[2] << 16)
+                    for h in range(128):
+                        AX = AX24 | (h << 24)
+                        if AX >= _M31:
+                            continue
+                        aq = AX * _INV16807 % _M31
+                        if not (1 <= aq <= _M31M1):
+                            continue
+                        for k in (0, 1):
+                            rv = aq - 1 + k * _M31M1
+                            if rv > _M32C:
+                                continue
+                            seed = aa_inv(rv)
+                            zt = (seed - state_val) % _M32
+                            corr = zt - z_val
+                            if abs(corr) < 100_000_000:
+                                votes[corr] += 1
+                else:  # n == 4 — fully determined
+                    AX = ks[0] | (ks[1] << 8) | (ks[2] << 16) | (ks[3] << 24)
+                    if AX >= _M31:
+                        continue
+                    aq = AX * _INV16807 % _M31
+                    if not (1 <= aq <= _M31M1):
+                        continue
+                    for k in (0, 1):
+                        rv = aq - 1 + k * _M31M1
+                        if rv > _M32C:
+                            continue
+                        seed = aa_inv(rv)
+                        zt = (seed - state_val) % _M32
+                        corr = zt - z_val
+                        if abs(corr) < 100_000_000:
+                            votes[corr] += 1
+    if not votes:
+        return []
+    # rank by plausibility: small drifts first (a handful of flipped branches)
+    corr = sorted(votes.keys(), key=lambda c: abs(c))
+    return [float(c) for c in corr[:24]]
+
+
+def _trial_run(interp, root, states, ztrace):
+    """Bounded trial emulation with the current z_correction applied."""
+    states.clear()
+    ztrace.clear()
+    interp.outputs.clear()
+    interp.calllog.clear()
+    interp.obs_round_calls.clear()
+    interp.byte_obs.clear()
+    err = None
+    chunk_env = None
+    try:
+        chunk_env = interp.exec_chunk(root)
+    except (LuaError, RecursionError) as e:
+        err = e
+    except Exception as e:
+        err = LuaError(str(e))
+    return len(states), err, chunk_env
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
@@ -907,7 +1324,9 @@ def main(argv=None):
         return 2
 
     interp = Interp()
+    interp.set_source(src)
     register_string_table(interp.globals_env.vars)
+    interp.z_var_name = find_z_var_name(root, d)
 
     states = []
     ztrace = []
@@ -932,14 +1351,63 @@ def main(argv=None):
                      fmt_num(d["init"]) if d["init"] is not None else "?"))
     print("\n".join(header))
 
+    # ---- self-healing emulation loop: on a nil-call crash (garbage decoded
+    # key), solve the true (state+Z) seed from known plaintexts, apply the
+    # recovered Z correction, and restart.  The drift accumulates from
+    # Roblox-vs-shim semantic gaps, so this iterates until clean.
     err = None
     chunk_env = None
-    try:
-        chunk_env = interp.exec_chunk(root)
-    except (LuaError, RecursionError) as e:
-        err = e
-    except Exception as e:  # shims raise plain exceptions inside pcall-protected code
-        err = LuaError(str(e))
+    MAX_HEAL = 8
+    tried = set()
+    for attempt in range(MAX_HEAL + 1):
+        states.clear()
+        ztrace.clear()
+        interp.outputs.clear()
+        interp.calllog.clear()
+        interp.obs_round_calls.clear()
+        interp.byte_obs.clear()
+        err = None
+        chunk_env = None
+        try:
+            chunk_env = interp.exec_chunk(root)
+        except (LuaError, RecursionError) as e:
+            err = e
+        except Exception as e:  # shims raise plain exceptions in pcall contexts
+            err = LuaError(str(e))
+        if err is None:
+            break
+        msg = str(err)
+        if "attempt to call a nil value" not in msg \
+                and "attempt to index" not in msg:
+            break
+        if attempt == MAX_HEAL:
+            break
+        cands = solve_z_correction(interp)
+        if not cands:
+            break
+        # validate candidates by emulation progress: the true correction
+        # executes the most steps before hitting the next decode problem
+        base_steps = interp.steps
+        best = None  # (steps, corr)
+        for c in cands:
+            interp.z_correction = float(c)
+            s2, e2, _ce2 = _trial_run(interp, root, states, ztrace)
+            steps2 = interp.steps
+            if e2 is None:
+                best = (steps2, float(c))
+                err = None
+                chunk_env = _ce2
+                break
+            if best is None or steps2 > best[0]:
+                best = (steps2, float(c))
+        if best is None:
+            break
+        interp.z_correction = best[1]
+        print("  [self-heal] applying Z correction %+d "
+              "(progress %d -> %d steps, attempt %d)"
+              % (int(best[1]), base_steps, best[0], attempt + 1))
+        if best[0] <= base_steps:
+            break  # no candidate made progress
 
     if len(states) > args.max_states + 2:
         note = " (stopped early: exceeded --max-states)"
