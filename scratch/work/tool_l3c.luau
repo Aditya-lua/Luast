@@ -1,0 +1,3 @@
+-- Recovered by luau_recover LUAST-L3 static emulator
+-- Source: obf_level3_compact.luau
+-- States executed: 0, unique: 0
