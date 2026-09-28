@@ -3,14 +3,124 @@ from __future__ import annotations
 import copy
 import math
 import struct
+import sys
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .analysis import Analyzer, Binding, analyze, binding_for, is_pure
 from .model import Node, children, clone_value, iter_nodes, walk
 
 
 UNKNOWN = object()
+
+
+class Phi:
+    """Symbolic both-branch value: the result of an if-expression whose
+    condition is unknown but whose leaves are all statically known.
+
+    LUAST junk predicates are built exactly like that: an auxiliary local
+    receives `if <unknown> then k1 else k2` and later arithmetic over it is
+    designed to yield the same answer for either branch. Propagating a Phi
+    through that arithmetic collapses the predicate to a constant instead
+    of forking the dispatch into two exponentially-growing paths."""
+
+    __slots__ = ("values",)
+
+    def __init__(self, *values: Any):
+        self.values = tuple(values)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"Phi{self.values}"
+
+
+def is_phi(value: Any) -> bool:
+    return isinstance(value, Phi)
+
+
+def unphi(value: Any) -> Any:
+    """Phi values must not leak into consumers that cannot handle them."""
+    return UNKNOWN if is_phi(value) else value
+
+
+def phi_apply(operator: Callable[..., Any], *operands: Any) -> Any:
+    """Apply a scalar operator component-wise over Phi/scalar operands.
+
+    Collapses to a plain scalar when every component produces the same
+    value of the same type; produces a fresh Phi when the components
+    differ but all stay numeric; returns UNKNOWN otherwise."""
+    size = 0
+    for value in operands:
+        if is_phi(value):
+            size = len(value.values)
+            break
+    if size == 0:
+        return operator(*operands)
+    if size > 4:
+        return UNKNOWN
+    results = []
+    for index in range(size):
+        column = [value.values[index] if is_phi(value) else value for value in operands]
+        try:
+            result = operator(*column)
+        except (TypeError, ValueError, OverflowError, ArithmeticError):
+            return UNKNOWN
+        if result is UNKNOWN:
+            return UNKNOWN
+        results.append(result)
+    first = results[0]
+    if all(type(result) is type(first) and result == first for result in results):
+        return first
+    if all(is_number(result) for result in results):
+        return Phi(*results)
+    return UNKNOWN
+
+
+def phi_from_leaves(leaves: list, eval_leaf: Callable[[Any], Any]) -> Any:
+    """Evaluate every if-expression leaf; Phi when they are known but differ."""
+    values = []
+    for leaf in leaves:
+        value = eval_leaf(leaf)
+        if value is UNKNOWN or is_phi(value):
+            return UNKNOWN
+        values.append(value)
+    if not values:
+        return UNKNOWN
+    first = values[0]
+    if all(type(value) is type(first) and value == first for value in values):
+        return first
+    if all(is_number(value) for value in values) or all(isinstance(value, bytes) for value in values):
+        return Phi(*values)
+    return UNKNOWN
+
+
+def phi_binop(operator: str, left: Any, right: Any) -> Any:
+    """Binary operator over operands that may contain Phi values."""
+    if operator == "..":
+        return phi_apply(lambda a, b: a + b if isinstance(a, bytes) and isinstance(b, bytes) else UNKNOWN, left, right)
+    if operator in {"==", "~=", "<", "<=", ">", ">="}:
+        def compare(a: Any, b: Any) -> Any:
+            if is_nan(a) or is_nan(b):
+                return operator == "~="
+            if numeric_kind(a) != numeric_kind(b) and not (is_number(a) and is_number(b)):
+                return UNKNOWN
+            if not is_number(a) and type(a) is not type(b):
+                return UNKNOWN
+            try:
+                if operator == "==":
+                    return a == b
+                if operator == "~=":
+                    return a != b
+                if operator == "<":
+                    return a < b
+                if operator == "<=":
+                    return a <= b
+                if operator == ">":
+                    return a > b
+                return a >= b
+            except (TypeError, ValueError):
+                return UNKNOWN
+        return phi_apply(compare, left, right)
+    return phi_apply(lambda a, b: numeric_result(operator, a, b), left, right)
 
 
 @dataclass
@@ -114,7 +224,13 @@ def numeric_result(op: str, left: Any, right: Any) -> Any:
             return UNKNOWN
         if isinstance(left, int) and isinstance(right, int):
             return left % right
-        return math.fmod(left, right)
+        # Lua/Luau float modulo is floor-based (a - floor(a/b)*b), not the
+        # C fmod sign convention; match Luau exactly so junk predicates that
+        # mix signs still evaluate bit-identically.
+        result = math.fmod(left, right)
+        if result != 0 and (result < 0) != (right < 0):
+            result += right
+        return result
     if op == "^":
         try:
             if abs(left) > 2 ** 53 or abs(right) > 64:
@@ -236,6 +352,14 @@ def evaluate(node: Node | None, env: dict[int, Any] | None = None, analyzer: Ana
         return UNKNOWN
     if node.kind == "unop":
         value = evaluate(node.get("expr"), env, analyzer)
+        if is_phi(value):
+            if node.get("op") == "not":
+                return phi_apply(lambda item: not truthy(item), value)
+            if node.get("op") == "-":
+                return phi_apply(lambda item: -item if is_number(item) else UNKNOWN, value)
+            if node.get("op") == "~":
+                return phi_apply(lambda item: ~item if is_int(item) else UNKNOWN, value)
+            return UNKNOWN
         if value is UNKNOWN:
             # Tautology rescue: `not (x or not x)` and friends are constant
             # even when the atom is unknown.
@@ -256,23 +380,25 @@ def evaluate(node: Node | None, env: dict[int, Any] | None = None, analyzer: Ana
         operator = node.get("op")
         if operator == "and":
             left = evaluate(node.get("left"), env, analyzer)
-            if left is UNKNOWN:
+            if left is UNKNOWN or is_phi(left):
                 resolved = bool_const(node)
                 return resolved if resolved is not None else UNKNOWN
             return evaluate(node.get("right"), env, analyzer) if truthy(left) else left
         if operator == "or":
             left = evaluate(node.get("left"), env, analyzer)
-            if left is UNKNOWN:
+            if left is UNKNOWN or is_phi(left):
                 resolved = bool_const(node)
                 return resolved if resolved is not None else UNKNOWN
             return left if truthy(left) else evaluate(node.get("right"), env, analyzer)
         left = evaluate(node.get("left"), env, analyzer)
         right = evaluate(node.get("right"), env, analyzer)
+        if is_phi(left) or is_phi(right):
+            return phi_binop(operator, left, right)
         if operator in {"==", "~=", "<", "<=", ">", ">="} and (is_nan(left) or is_nan(right)):
             return operator == "~="
         if left is UNKNOWN or right is UNKNOWN:
             if operator in {"==", "~=", "<", "<=", ">", ">="}:
-                folded = _junk_truth(node, lambda item: evaluate(item, env, analyzer))
+                folded = _junk_truth(node, lambda item: unphi(evaluate(item, env, analyzer)))
                 if folded is not None:
                     return folded
             return UNKNOWN
@@ -301,17 +427,28 @@ def evaluate(node: Node | None, env: dict[int, Any] | None = None, analyzer: Ana
                 return UNKNOWN
         return numeric_result(operator, left, right)
     if node.kind == "ifexpr":
+        all_leaves = [node.get("then")] + [branch_value for _, branch_value in node.get("elifs", [])] + [node.get("else_")]
         condition = evaluate(node.get("cond"), env, analyzer)
+        if is_phi(condition):
+            if all(type(item) is bool for item in condition.values) and all(item == condition.values[0] for item in condition.values):
+                condition = condition.values[0]
+            else:
+                return phi_from_leaves(all_leaves, lambda leaf: evaluate(leaf, env, analyzer))
         if condition is UNKNOWN:
-            return UNKNOWN
+            return phi_from_leaves(all_leaves, lambda leaf: evaluate(leaf, env, analyzer))
         if truthy(condition):
             return evaluate(node.get("then"), env, analyzer)
-        for branch_condition, branch_value in node.get("elifs", []):
+        pending = list(node.get("elifs", []))
+        index = 0
+        while index < len(pending):
+            branch_condition, branch_value = pending[index]
             branch_result = evaluate(branch_condition, env, analyzer)
-            if branch_result is UNKNOWN:
-                return UNKNOWN
+            if branch_result is UNKNOWN or is_phi(branch_result):
+                remaining = [branch_value] + [item for _, item in pending[index + 1:]] + [node.get("else_")]
+                return phi_from_leaves(remaining, lambda leaf: evaluate(leaf, env, analyzer))
             if truthy(branch_result):
                 return evaluate(branch_value, env, analyzer)
+            index += 1
         return evaluate(node.get("else_"), env, analyzer)
     return UNKNOWN
 
@@ -333,7 +470,10 @@ def transform_expr(node: Node, callback: Callable[[Node, bool], Node], target: b
         node.fields["args"] = [transform_expr(item, callback) for item in node.get("args", [])]
     elif kind == "index":
         node.fields["obj"] = transform_expr(node.get("obj"), callback, target)
-        node.fields["key"] = transform_expr(node.get("key"), callback, target)
+        # The KEY of an index is a value position even when the index
+        # itself is an assignment target (`t[pool[k]] = v` reads pool[k]),
+        # so it must never inherit the target flag.
+        node.fields["key"] = transform_expr(node.get("key"), callback, False)
     elif kind in ("indexname", "methodname"):
         node.fields["obj"] = transform_expr(node.get("obj"), callback)
     elif kind == "function":
@@ -525,7 +665,7 @@ def fold_constants(root: Node, analyzer: Analyzer, stats: PassStats, rounds: int
                 return node
             if node.kind == "if":
                 condition = evaluate(node.get("cond"), environment, analyzer)
-                if condition is not UNKNOWN:
+                if condition is not UNKNOWN and not is_phi(condition):
                     selected: list[Node] = []
                     if truthy(condition):
                         selected = node.get("then", [])
@@ -543,7 +683,7 @@ def fold_constants(root: Node, analyzer: Analyzer, stats: PassStats, rounds: int
                 return node
             if node.kind == "while":
                 condition = evaluate(node.get("cond"), environment, analyzer)
-                if condition is not UNKNOWN and not truthy(condition):
+                if condition is not UNKNOWN and not is_phi(condition) and not truthy(condition):
                     # The body of a while loop never runs when the leading
                     # condition is provably false; the loop is dead code.
                     changed[0] = True
@@ -554,7 +694,7 @@ def fold_constants(root: Node, analyzer: Analyzer, stats: PassStats, rounds: int
                 condition = evaluate(node.get("cond"), environment, analyzer)
                 body = node.get("body", [])
                 has_edges = any(leaf.kind in {"break", "continue"} for leaf in iter_nodes(body))
-                if condition is not UNKNOWN and not truthy(condition) and not has_edges:
+                if condition is not UNKNOWN and not is_phi(condition) and not truthy(condition) and not has_edges:
                     # repeat ... until false runs the body exactly once.
                     changed[0] = True
                     stats.branches_removed += 1
@@ -568,7 +708,7 @@ def fold_constants(root: Node, analyzer: Analyzer, stats: PassStats, rounds: int
             if node.kind in {"number", "string", "bool", "nil", "name", "vararg", "interpolated", "opaque"}:
                 return node
             result = evaluate(node, environment, analyzer)
-            if result is not UNKNOWN:
+            if result is not UNKNOWN and not is_phi(result):
                 replacement = value_node(result)
                 replacement.start = node.start
                 replacement.end = node.end
@@ -795,29 +935,45 @@ def memo_guard_bindings(root: Node, analyzer: Analyzer) -> set[int]:
     no matter what value X holds at runtime, which unlocks constant pools
     that only escaped through the stored tables (commonly nested inside
     decoder closures)."""
-    parents = parent_map_of(root)
     guard_count: dict[int, int] = {}
     external: dict[int, bool] = {}
-    for node in walk(root):
-        if node.kind != "name":
-            continue
-        binding = binding_for(analyzer, node)
-        if binding is None:
-            continue
-        parent = parents.get(id(node))
-        if isinstance(parent, Node) and parent.kind == "unop" and parent.get("op") == "not":
-            grand = parents.get(id(parent))
-            if isinstance(grand, Node) and grand.kind == "if" and grand.get("cond") is parent:
-                guard_count[binding.ident] = guard_count.get(binding.ident, 0) + 1
-                continue
-        if isinstance(parent, Node) and parent.kind == "table":
-            table_parent = parents.get(id(parent))
-            if isinstance(table_parent, Node) and table_parent.kind == "assign":
-                targets = table_parent.get("targets", [])
-                if len(targets) == 1 and isinstance(targets[0], Node) and targets[0].kind == "name" and binding_for(analyzer, targets[0]) is binding:
-                    # self-reference inside a stored table: unobservable
-                    continue
-        external[binding.ident] = True
+    chain: list[Node] = []
+
+    def visit(node: Node) -> None:
+        if node.kind == "name":
+            binding = binding_for(analyzer, node)
+            if binding is not None:
+                parent = chain[-1] if chain else None
+                if isinstance(parent, Node) and parent.kind == "unop" and parent.get("op") == "not":
+                    grand = chain[-2] if len(chain) >= 2 else None
+                    if isinstance(grand, Node) and grand.kind == "if" and grand.get("cond") is parent:
+                        guard_count[binding.ident] = guard_count.get(binding.ident, 0) + 1
+                        chain.append(node)
+                        chain.pop()
+                        return
+                if isinstance(parent, Node) and parent.kind == "table":
+                    table_parent = chain[-2] if len(chain) >= 2 else None
+                    if isinstance(table_parent, Node) and table_parent.kind == "assign":
+                        targets = table_parent.get("targets", [])
+                        if len(targets) == 1 and isinstance(targets[0], Node) and targets[0].kind == "name" and binding_for(analyzer, targets[0]) is binding:
+                            # self-reference inside a stored table: unobservable
+                            return
+                external[binding.ident] = True
+        chain.append(node)
+        for value in node.fields.values():
+            if isinstance(value, Node):
+                visit(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, Node):
+                        visit(item)
+                    elif isinstance(item, (list, tuple)):
+                        for nested in item:
+                            if isinstance(nested, Node):
+                                visit(nested)
+        chain.pop()
+
+    visit(root)
     return {ident for ident, count in guard_count.items() if count >= 1 and not external.get(ident)}
 
 
@@ -945,17 +1101,6 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
     if not roots:
         return root
 
-    parents = parent_map_of(root)
-
-    def pool_root_of(node: Node | None) -> int | None:
-        if not isinstance(node, Node) or node.kind != "name":
-            return None
-        binding = binding_for(analyzer, node)
-        if binding is None:
-            return None
-        root_id = aliases.get(binding.ident, binding.ident)
-        return root_id if root_id in roots else None
-
     # Occurrences that keep a pool alive: any value-position read of the
     # pool object or of a slot whose key cannot be resolved.
     alive: set[int] = set()
@@ -970,34 +1115,68 @@ def remove_dead_pool_writes(root: Node, analyzer: Analyzer, stats: PassStats) ->
             for descendant in children(node):
                 deferred.add(id(descendant))
     key_reads: dict[int, dict[Any, set[int | None]]] = {}
-    for node in walk(root):
-        if node.kind != "name":
-            continue
+    chain: list[Node] = []
+
+    def visit_names(node: Node) -> None:
+        if node.kind == "name":
+            binding = binding_for(analyzer, node)
+            if binding is not None:
+                root_id = aliases.get(binding.ident, binding.ident)
+                if root_id in roots:
+                    parent = chain[-1] if chain else None
+                    if isinstance(parent, Node) and parent.kind == "index" and parent.get("obj") is node:
+                        grand = chain[-2] if len(chain) >= 2 else None
+                        in_target = isinstance(grand, Node) and grand.kind == "assign" and any(target is parent for target in grand.get("targets", []))
+                        if not in_target:
+                            key = literal(parent.get("key"))
+                            if key is UNKNOWN:
+                                alive.add(root_id)
+                            else:
+                                if id(parent) in deferred:
+                                    owner = None
+                                else:
+                                    owner = None
+                                    for ancestor in reversed(chain):
+                                        if ancestor.kind == "function":
+                                            owner = None
+                                            break
+                                        if ancestor.kind in STATEMENT_KINDS:
+                                            owner = id(ancestor)
+                                            break
+                                key_reads.setdefault(root_id, {}).setdefault(pool_key(key), set()).add(owner)
+                        chain.append(node)
+                        chain.pop()
+                        return
+                    if isinstance(parent, Node) and parent.kind == "local" and any(value is node for value in parent.get("values", [])):
+                        # alias declaration; tracked through the alias map
+                        return
+                    if isinstance(parent, Node) and parent.kind == "assign" and any(target is node for target in parent.get("targets", [])):
+                        return
+                    alive.add(root_id)
+        chain.append(node)
+        for value in node.fields.values():
+            if isinstance(value, Node):
+                visit_names(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, Node):
+                        visit_names(item)
+                    elif isinstance(item, (list, tuple)):
+                        for nested in item:
+                            if isinstance(nested, Node):
+                                visit_names(nested)
+        chain.pop()
+
+    visit_names(root)
+
+    def pool_root_of(node: Node | None) -> int | None:
+        if not isinstance(node, Node) or node.kind != "name":
+            return None
         binding = binding_for(analyzer, node)
         if binding is None:
-            continue
+            return None
         root_id = aliases.get(binding.ident, binding.ident)
-        if root_id not in roots:
-            continue
-        parent = parents.get(id(node))
-        if isinstance(parent, Node) and parent.kind == "index" and parent.get("obj") is node:
-            grand = parents.get(id(parent))
-            in_target = isinstance(grand, Node) and grand.kind == "assign" and any(target is parent for target in grand.get("targets", []))
-            if in_target:
-                continue
-            key = literal(parent.get("key"))
-            if key is UNKNOWN:
-                alive.add(root_id)
-            else:
-                owner = None if id(parent) in deferred else key_reads_owner(parents, parent)
-                key_reads.setdefault(root_id, {}).setdefault(pool_key(key), set()).add(owner)
-            continue
-        if isinstance(parent, Node) and parent.kind == "local" and any(value is node for value in parent.get("values", [])):
-            # alias declaration; tracked through the alias map
-            continue
-        if isinstance(parent, Node) and parent.kind == "assign" and any(target is node for target in parent.get("targets", [])):
-            continue
-        alive.add(root_id)
+        return root_id if root_id in roots else None
 
     removed = 0
 
@@ -1109,6 +1288,21 @@ class BufferValue:
     data: bytes
 
 
+def walk_unique(root: Node) -> Iterator[Node]:
+    """Lean walker for freshly-parsed trees: no seen-set, no allocation.
+
+    PoolResolver runs on trees where every node is unique (direct parser
+    output or clone-based transforms), so the defensive dedup set in
+    walk() — one set entry per node, several hundred MB on multi-MB
+    inputs — is pure overhead here."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        for child in children(node):
+            stack.append(child)
+
+
 class PoolResolver:
     def __init__(self, root: Node, analyzer: Analyzer, source: str, allow_escape: bool = False):
         self.root = root
@@ -1129,6 +1323,15 @@ class PoolResolver:
         self.base_states: dict[int, dict[tuple[Any, ...], Node]] = {}
         self.invalid_after: int | None = None
         self.decoder_cache: dict[int, str | None] = {}
+        self.alias_candidates: list[tuple[int, Node, int]] = []
+        self.alias_bases: dict[int, Node] = {}
+        self.alias_base_decl: dict[int, int] = {}
+        self.alias_keys: dict[int, tuple[int, tuple[tuple[Any, ...], ...]]] = {}
+        self.alias_stable: dict[int, bool] = {}
+        self.nested_overlays: dict[tuple[int, tuple[tuple[Any, ...], ...]], dict[tuple[Any, ...], Node]] = {}
+        self.nested_writes: list[tuple[int, int]] = []
+        self.table_state_memo: dict[int, dict[tuple[Any, ...], Node]] = {}
+        self.bare_local_candidates = False
         self.safe = True
         self.discover()
 
@@ -1139,7 +1342,8 @@ class PoolResolver:
             self.safe = False
 
     def discover(self) -> None:
-        for node in walk(self.root):
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+        for node in walk_unique(self.root):
             if node.kind != "local":
                 continue
             bindings = self.analyzer.declaration_bindings.get(id(node), [])
@@ -1151,14 +1355,28 @@ class PoolResolver:
                 source_binding = binding_for(self.analyzer, values[0])
                 if source_binding is not None:
                     self.aliases[bindings[0].ident] = source_binding.ident
+            elif len(bindings) == 1 and len(values) == 1 and values[0].kind == "index":
+                # `local x = pool[a][b]` aliases a nested pool table; reads
+                # through it resolve against the aliased table literal.
+                if not bindings[0].writes:
+                    self.alias_candidates.append((bindings[0].ident, values[0], node.end))
+            elif len(bindings) >= 1 and not values:
+                self.bare_local_candidates = True
+        if not self.bare_local_candidates:
+            self.bare_local_candidates = any(
+                isinstance(node, Node) and node.kind == "assign" and len(node.get("targets", [])) == 1
+                and node.get("targets", [])[0].kind == "name" and node.get("values", [])[0].kind == "table"
+                for node in walk_unique(self.root)
+            )
         use_positions: dict[int, int] = {}
-        for node in walk(self.root):
-            if node.kind != "name":
-                continue
-            binding = binding_for(self.analyzer, node)
-            if binding is not None:
-                use_positions[binding.ident] = min(use_positions.get(binding.ident, node.start), node.start)
-        for node in walk(self.root):
+        if self.bare_local_candidates:
+            for node in walk_unique(self.root):
+                if node.kind != "name":
+                    continue
+                binding = binding_for(self.analyzer, node)
+                if binding is not None:
+                    use_positions[binding.ident] = min(use_positions.get(binding.ident, node.start), node.start)
+        for node in walk_unique(self.root):
             if node.kind != "assign" or len(node.get("targets", [])) != 1 or len(node.get("values", [])) != 1:
                 continue
             target = node.get("targets", [])[0]
@@ -1182,7 +1400,15 @@ class PoolResolver:
                 if target in self.aliases:
                     self.aliases[alias] = self.aliases[target]
                     changed = True
-        for node in walk(self.root):
+        for ident, expression, decl_end in self.alias_candidates:
+            root_id = self._index_root(expression)
+            path = self._index_path(expression)
+            if root_id is None or not path:
+                continue
+            self.alias_bases[ident] = expression
+            self.alias_base_decl[ident] = decl_end
+            self.alias_keys[ident] = (root_id, tuple(path))
+        for node in walk_unique(self.root):
             if node.kind == "assign":
                 targets = node.get("targets", [])
                 values = node.get("values", [])
@@ -1193,55 +1419,72 @@ class PoolResolver:
                     self.targets.add(id(target))
                     if target.kind != "index":
                         continue
-                    base = target.get("obj")
-                    if not isinstance(base, Node) or base.kind != "name":
-                        continue
-                    binding = binding_for(self.analyzer, base)
-                    if binding is None:
-                        continue
-                    root_id = self.aliases.get(binding.ident, binding.ident)
-                    if root_id not in self.roots:
-                        continue
-                    key = literal(target.get("key"))
-                    if key is UNKNOWN:
+                    if target_index >= len(values):
                         self.invalidate(node.start)
                         continue
-                    if target_index >= len(values):
+                    base = target.get("obj")
+                    pool_target = False
+                    if isinstance(base, Node):
+                        if base.kind == "name":
+                            binding = binding_for(self.analyzer, base)
+                            if binding is not None:
+                                root_id = self.aliases.get(binding.ident, binding.ident)
+                                pool_target = root_id in self.roots or self.alias_owner_of(base) is not None
+                        elif base.kind == "index":
+                            nested_root = self._index_root(base)
+                            if nested_root is not None:
+                                pool_target = True
+                                self.nested_writes.append((node.start, nested_root))
+                    if not pool_target:
+                        continue
+                    if literal(target.get("key")) is UNKNOWN:
                         self.invalidate(node.start)
                         continue
                     self.events.append((node.start, node.end, target, values[target_index], True))
             if node.kind == "index":
+                if id(node) in self.targets:
+                    continue
                 base = node.get("obj")
-                if isinstance(base, Node) and base.kind == "name":
+                if not isinstance(base, Node):
+                    continue
+                if base.kind == "name":
                     binding = binding_for(self.analyzer, base)
-                    if binding is not None:
-                        root_id = self.aliases.get(binding.ident, binding.ident)
-                        if root_id in self.roots and id(node) not in self.targets:
-                            self.reads.append(node)
+                    if binding is None:
+                        continue
+                    root_id = self.aliases.get(binding.ident, binding.ident)
+                    if root_id in self.roots or self.alias_owner_of(base) is not None:
+                        self.reads.append(node)
+                elif base.kind == "index":
+                    if self._index_root(base) is not None:
+                        self.reads.append(node)
         self.reads.sort(key=lambda item: item.start)
         self.events.sort(key=lambda item: item[0])
-        self.parents = self.parent_map()
-        for node in walk(self.root):
-            if node.kind != "name":
-                continue
-            binding = binding_for(self.analyzer, node)
-            if binding is None:
-                continue
-            root_id = self.aliases.get(binding.ident, binding.ident)
-            if root_id not in self.roots:
-                continue
-            if id(node) in self.targets:
-                continue
-            parent = self.parents.get(id(node))
-            if parent is not None and parent.kind == "index" and parent.get("obj") is node:
-                continue
-            if parent is not None and parent.kind == "local" and node in parent.get("values", []):
-                continue
-            if parent is not None and parent.kind == "assign" and node in parent.get("targets", []):
-                continue
-            if not self.allow_escape:
-                self.safe = False
-                break
+        # An alias of a nested table (fAJ -> fAc[140]) is only usable while
+        # the aliased slot is not rewritten and no in-place mutation of the
+        # aliased table happens after the alias declaration.
+        write_positions: dict[tuple[int, tuple[Any, ...]], list[int]] = {}
+        for start, _, target, _, _ in self.events:
+            base = target.get("obj")
+            if isinstance(base, Node) and base.kind == "name":
+                binding = binding_for(self.analyzer, base)
+                if binding is not None:
+                    root_id = self.aliases.get(binding.ident, binding.ident)
+                    key = self.key_for(target.get("key"))
+                    if root_id in self.roots and key is not None:
+                        write_positions.setdefault((root_id, key), []).append(start)
+        for ident, (root_id, path) in self.alias_keys.items():
+            decl_end = self.alias_base_decl[ident]
+            # In-place nested writes are modeled through overlays, so they do
+            # NOT destabilize an alias; only a top-level rewrite of the aliased
+            # slot does (the alias captured the old table object).
+            stable = not any(start > decl_end for start in write_positions.get((root_id, path[0]), []))
+            self.alias_stable[ident] = stable
+        self.parents = self.limited_parent_map()
+        # With allow_escape the escape walk below is a no-op (it can only
+        # clear self.safe, which allow_escape already overrides).
+        if self.allow_escape:
+            return
+        self._escape_check()
         for node in walk(self.root):
             for key in ("body", "then", "else_"):
                 value = node.fields.get(key)
@@ -1250,6 +1493,77 @@ class PoolResolver:
             for _, body in node.fields.get("elifs", []):
                 if isinstance(body, list):
                     self.statement_nodes.update(id(item) for item in body if isinstance(item, Node))
+
+    def _escape_check(self) -> None:
+        """A pool name read outside an index/key or alias position escapes
+        the constant model. Single walk carrying the parent chain (no
+        full parent map needed)."""
+        chain: list[Node] = []
+
+        def visit(node: Node) -> bool:
+            if node.kind == "name" and not self.safe:
+                return False
+            if node.kind == "name":
+                binding = binding_for(self.analyzer, node)
+                if binding is not None:
+                    root_id = self.aliases.get(binding.ident, binding.ident)
+                    if root_id in self.roots and id(node) not in self.targets:
+                        parent = chain[-1] if chain else None
+                        escaped = not (
+                            (parent is not None and parent.kind == "index" and parent.get("obj") is node)
+                            or (parent is not None and parent.kind == "local" and any(value is node for value in parent.get("values", [])))
+                            or (parent is not None and parent.kind == "assign" and any(target is node for target in parent.get("targets", [])))
+                        )
+                        if escaped:
+                            self.safe = False
+                            return False
+            chain.append(node)
+            for value in node.fields.values():
+                if isinstance(value, Node):
+                    if not visit(value):
+                        return False
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, Node):
+                            if not visit(item):
+                                return False
+                        elif isinstance(item, (list, tuple)):
+                            for nested in item:
+                                if isinstance(nested, Node):
+                                    if not visit(nested):
+                                        return False
+            chain.pop()
+            return True
+
+        visit(self.root)
+
+    def limited_parent_map(self) -> dict[int, tuple[Node, ...]]:
+        """Parent chains recorded ONLY for pool-read nodes (a full id->node
+        map costs hundreds of MB on multi-MB inputs). Chains cover the
+        is_object/is_callee position checks (up to 20 levels)."""
+        reads = {id(node) for node in self.reads}
+        result: dict[int, tuple[Node, ...]] = {}
+        chain: list[Node] = []
+
+        def visit(node: Node) -> None:
+            if id(node) in reads:
+                result[id(node)] = tuple(chain[:20])
+            chain.append(node)
+            for value in node.fields.values():
+                if isinstance(value, Node):
+                    visit(value)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, Node):
+                            visit(item)
+                        elif isinstance(item, (list, tuple)):
+                            for nested in item:
+                                if isinstance(nested, Node):
+                                    visit(nested)
+            chain.pop()
+
+        visit(self.root)
+        return result
 
     def parent_map(self) -> dict[int, Node]:
         result: dict[int, Node] = {}
@@ -1268,32 +1582,23 @@ class PoolResolver:
         return result
 
     def is_object_position(self, node: Node) -> bool:
-        current = node
-        for _ in range(16):
-            parent = self.parents.get(id(current))
-            if parent is None:
-                return False
-            if parent.kind in {"index", "indexname", "methodcall"} and parent.get("obj") is current:
-                return True
-            if parent.kind == "index" and parent.get("obj") is current:
-                return True
+        chain = self.parents.get(id(node))
+        if not chain:
             return False
-        return False
+        parent = chain[0]
+        return parent.kind in {"index", "indexname", "methodcall"} and parent.get("obj") is node
 
     def is_callee_position(self, node: Node) -> bool:
+        chain = self.parents.get(id(node))
+        if not chain:
+            return False
         current = node
-        for _ in range(16):
-            parent = self.parents.get(id(current))
-            if parent is None:
-                return False
+        for parent in chain:
             if parent.kind == "call" and parent.get("func") is current:
                 return True
             if parent.kind == "methodcall" and parent.get("obj") is current:
                 return True
-            if parent.kind == "index" and parent.get("obj") is current:
-                current = parent
-                continue
-            if parent.kind == "indexname" and parent.get("obj") is current:
+            if parent.kind in {"index", "indexname"} and parent.get("obj") is current:
                 current = parent
                 continue
             return False
@@ -1362,10 +1667,133 @@ class PoolResolver:
                         return fallback[key]
             base_value = self.resolve_value(base, state, seen) if isinstance(base, Node) else None
             if base_value is not None and base_value.kind == "table":
-                table_state = self.initial_state_for_table(base_value)
+                table_state = self.table_state_of(base_value)
                 return table_state.get(key)
             return None
         return None
+
+    def table_state_of(self, table: Node) -> dict[tuple[Any, ...], Node]:
+        memo = self.table_state_memo.get(id(table))
+        if memo is None:
+            memo = self.initial_state_for_table(table)
+            self.table_state_memo[id(table)] = memo
+        return memo
+
+    def _index_root(self, node: Node | None) -> int | None:
+        """Root pool id of an index chain, or None when it does not start
+        at a known pool (following local aliases)."""
+        current = node
+        while isinstance(current, Node) and current.kind == "index":
+            current = current.get("obj")
+        if not isinstance(current, Node) or current.kind != "name":
+            return None
+        binding = binding_for(self.analyzer, current)
+        if binding is None:
+            return None
+        root_id = self.aliases.get(binding.ident, binding.ident)
+        return root_id if root_id in self.roots else None
+
+    def _index_path(self, node: Node | None) -> tuple[tuple[Any, ...], ...] | None:
+        """Literal key path of an index chain (outermost key last)."""
+        keys: list[tuple[Any, ...]] = []
+        current: Node | None = node
+        while isinstance(current, Node) and current.kind == "index":
+            key = self.key_for(current.get("key"))
+            if key is None:
+                return None
+            keys.append(key)
+            current = current.get("obj")
+        keys.reverse()
+        return tuple(keys)
+
+    def alias_owner_of(self, node: Node) -> int | None:
+        """Follow local alias chains to an index-alias declared from a pool."""
+        binding = binding_for(self.analyzer, node)
+        if binding is None:
+            return None
+        owner = binding.ident
+        hops = 0
+        while owner not in self.alias_bases and owner in self.aliases and hops < 8:
+            owner = self.aliases[owner]
+            hops += 1
+        return owner if owner in self.alias_bases else None
+
+    def write_path(self, target: Node) -> tuple[int, tuple[tuple[Any, ...], ...]] | None:
+        """(root, key path) a pool write assigns to, covering nested tables
+        written directly (pool[a][b] = v) or through an alias (alias[b] = v)."""
+        if not isinstance(target, Node) or target.kind != "index":
+            return None
+        key = self.key_for(target.get("key"))
+        if key is None:
+            return None
+        base = target.get("obj")
+        if not isinstance(base, Node):
+            return None
+        if base.kind == "name":
+            owner = self.alias_owner_of(base)
+            if owner is not None:
+                if not self.alias_stable.get(owner, False):
+                    return None
+                base_root, base_path = self.alias_keys[owner]
+                return base_root, tuple(base_path) + (key,)
+            binding = binding_for(self.analyzer, base)
+            if binding is None:
+                return None
+            root_id = self.aliases.get(binding.ident, binding.ident)
+            if root_id not in self.roots:
+                return None
+            return root_id, (key,)
+        if base.kind == "index":
+            base_root = self._index_root(base)
+            base_path = self._index_path(base)
+            if base_root is None or not base_path:
+                return None
+            return base_root, tuple(base_path) + (key,)
+        return None
+
+    def materialize_overlay(self, root_id: int, base_path: tuple[tuple[Any, ...], ...], states: dict[int, dict[tuple[Any, ...], Node]]) -> dict[tuple[Any, ...], Node] | None:
+        """Mutable copy of the table stored at `base_path`, tracking in-place
+        writes without corrupting the shared table literal."""
+        overlay_key = (root_id, base_path)
+        overlay = self.nested_overlays.get(overlay_key)
+        if overlay is not None:
+            return overlay
+        state = states.get(root_id)
+        if state is None:
+            return None
+        current = state.get(base_path[0])
+        for key in base_path[1:]:
+            if not isinstance(current, Node) or current.kind != "table":
+                return None
+            current = self.table_state_of(current).get(key)
+        if not isinstance(current, Node) or current.kind != "table":
+            return None
+        overlay = dict(self.table_state_of(current))
+        self.nested_overlays[overlay_key] = overlay
+        return overlay
+
+    def resolve_alias_read(self, read: Node, states: dict[int, dict[tuple[Any, ...], Node]]) -> Node | None:
+        """Resolve `alias[key]` where the alias local was declared from a
+        nested pool table (`local alias = pool[slot]`)."""
+        base = read.get("obj")
+        if not isinstance(base, Node) or base.kind != "name":
+            return None
+        owner = self.alias_owner_of(base)
+        if owner is None or not self.alias_stable.get(owner, False):
+            return None
+        key = self.key_for(read.get("key"))
+        if key is None:
+            return None
+        base_root, base_path = self.alias_keys[owner]
+        full_path = tuple(base_path) + (key,)
+        overlay = self.nested_overlays.get((base_root, full_path[:-1]))
+        if overlay is not None:
+            return overlay.get(full_path[-1])
+        expression = self.alias_bases[owner]
+        table_value = self.resolve_value(expression, states[base_root])
+        if not isinstance(table_value, Node) or table_value.kind != "table":
+            return None
+        return self.table_state_of(table_value).get(key)
 
     def initial_state_for_table(self, table: Node) -> dict[tuple[Any, ...], Node]:
         result: dict[tuple[Any, ...], Node] = {}
@@ -1407,18 +1835,34 @@ class PoolResolver:
                 start = event_starts[event_index]
                 pending: list[tuple[int, tuple[Any, ...], Node]] = []
                 for _, _, target, event_rhs, _ in grouped[start]:
-                    base = target.get("obj")
-                    root_id = self.root_for(base) if isinstance(base, Node) else None
-                    key = self.key_for(target.get("key"))
-                    if root_id is None or key is None:
+                    path_info = self.write_path(target)
+                    if path_info is None:
                         continue
-                    pending.append((root_id, key, self.event_value(event_rhs, states[root_id])))
-                for root_id, key, resolved in pending:
-                    states[root_id][key] = resolved
+                    event_root, event_path = path_info
+                    event_node_value = self.event_value(event_rhs, states[event_root])
+                    if len(event_path) >= 2:
+                        overlay = self.materialize_overlay(event_root, event_path[:-1], states)
+                        if overlay is not None:
+                            overlay[event_path[-1]] = event_node_value
+                        continue
+                    pending.append((event_root, event_path[0], event_node_value))
+                for event_root, key, resolved_value in pending:
+                    states[event_root][key] = resolved_value
+                    self.nested_overlays.pop((event_root, (key,)), None)
                 event_index += 1
             base = read.get("obj")
-            root_id = self.root_for(base) if isinstance(base, Node) else None
-            resolved = self.resolve_value(read, states[root_id]) if root_id is not None else None
+            root_id = self._index_root(read) if isinstance(base, Node) else None
+            resolved = None
+            if root_id is not None:
+                path = self._index_path(read)
+                if path is not None and len(path) >= 2:
+                    overlay = self.nested_overlays.get((root_id, path[:-1]))
+                    if overlay is not None:
+                        resolved = overlay.get(path[-1])
+                if resolved is None:
+                    resolved = self.resolve_value(read, states[root_id])
+            else:
+                resolved = self.resolve_alias_read(read, states)
             if resolved is None:
                 continue
             value = literal(resolved)
@@ -1437,7 +1881,7 @@ class PoolResolver:
 
     def build_local_values(self) -> None:
         declarations: list[Node] = []
-        for node in walk(self.root):
+        for node in walk_unique(self.root):
             if node.kind == "local" or (node.kind == "assign" and len(node.get("targets", [])) == 1 and len(node.get("values", [])) == 1):
                 declarations.append(node)
         declarations.sort(key=lambda item: item.start)

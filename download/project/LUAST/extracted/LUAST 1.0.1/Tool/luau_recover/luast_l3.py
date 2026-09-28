@@ -17,6 +17,7 @@ import argparse
 import math
 import os
 import sys
+import time
 
 from . import lua_rt as _luart
 from .lua_rt import (  # noqa: E402
@@ -47,6 +48,8 @@ def _rbs_known_type(v):
 
 MAX_LOOP_ITERS = 200000
 MAX_TOTAL_STEPS = 2000000
+DEADLINE_SECONDS = float(os.environ.get("LUAST_L3_SECONDS", "90"))
+_DEADLINE = None
 
 
 class Env:
@@ -362,6 +365,9 @@ class Interp:
         self.steps += 1
         if self.steps > MAX_TOTAL_STEPS:
             raise LuaError("emulation step limit exceeded")
+        if _DEADLINE is not None and (self.steps & 8191) == 0 \
+                and time.monotonic() > _DEADLINE:
+            raise LuaError("emulation time budget exceeded")
         k = e.kind
         if k == "paren":
             return self.eval(e.get("expr"), env)
@@ -1304,6 +1310,7 @@ def _trial_run(interp, root, states, ztrace):
 
 
 def main(argv=None):
+    global _DEADLINE
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
     ap.add_argument("-o", "--output")
@@ -1324,6 +1331,7 @@ def main(argv=None):
         return 2
 
     interp = Interp()
+    _DEADLINE = time.monotonic() + DEADLINE_SECONDS
     interp.set_source(src)
     register_string_table(interp.globals_env.vars)
     interp.z_var_name = find_z_var_name(root, d)

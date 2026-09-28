@@ -6,8 +6,8 @@ from typing import Any
 
 from .analysis import Analyzer, Binding, binding_for
 from .emitter import Emitter
-from .model import Node, clone_value, walk
-from .passes import UNKNOWN, bool_const, constant_environment, evaluate, is_number, is_int, numeric_result, truthy, builtin_call, value_node
+from .model import Node, clone_value, count_nodes, walk
+from .passes import UNKNOWN, bool_const, constant_environment, evaluate, is_number, is_int, numeric_result, truthy, builtin_call, value_node, is_phi, phi_apply, phi_binop, phi_from_leaves, unphi
 
 
 class StateSubstitutionError(Exception):
@@ -67,6 +67,10 @@ class DispatcherPass:
         self.max_paths = 96
         self.max_work = 400000
         self.emit_budget = 40000
+        # Emitted-tree node cap: DAG-shaped state graphs tree-expand during
+        # emit (shared successors re-emitted per predecessor), so the final
+        # tree can dwarf the graph itself. Bail oversized dispatchers.
+        self.max_emit_nodes = 150000
         self.work = 0
         self.base_env = constant_environment(analyzer)
         self.bailed: set[int] = set()
@@ -333,6 +337,12 @@ class DispatcherPass:
             return self.eval_data(node.get("expr"), state, value, env)
         if node.kind == "unop":
             inner = self.eval_data(node.get("expr"), state, value, env)
+            if is_phi(inner):
+                if node.get("op") == "not":
+                    return phi_apply(lambda item: not truthy(item), inner)
+                if node.get("op") == "-":
+                    return phi_apply(lambda item: -item if is_number(item) else UNKNOWN, inner)
+                return UNKNOWN
             if inner is UNKNOWN:
                 resolved = bool_const(node)
                 return resolved if resolved is not None else UNKNOWN
@@ -347,20 +357,22 @@ class DispatcherPass:
             operator = node.get("op")
             if operator == "and":
                 left = self.eval_data(node.get("left"), state, value, env)
-                if left is UNKNOWN:
+                if left is UNKNOWN or is_phi(left):
                     resolved = bool_const(node)
                     return resolved if resolved is not None else UNKNOWN
                 return self.eval_data(node.get("right"), state, value, env) if truthy(left) else left
             if operator == "or":
                 left = self.eval_data(node.get("left"), state, value, env)
-                if left is UNKNOWN:
+                if left is UNKNOWN or is_phi(left):
                     resolved = bool_const(node)
                     return resolved if resolved is not None else UNKNOWN
                 return left if truthy(left) else self.eval_data(node.get("right"), state, value, env)
             left = self.eval_data(node.get("left"), state, value, env)
             right = self.eval_data(node.get("right"), state, value, env)
+            if is_phi(left) or is_phi(right):
+                return phi_binop(operator, left, right)
             if operator in {"==", "~=", "<", "<=", ">", ">="} and (left is UNKNOWN or right is UNKNOWN):
-                folded = _junk_truth(node, lambda item: self.eval_data(item, state, value, env))
+                folded = _junk_truth(node, lambda item: unphi(self.eval_data(item, state, value, env)))
                 if folded is not None:
                     return folded
             if left is UNKNOWN or right is UNKNOWN:
@@ -388,17 +400,23 @@ class DispatcherPass:
             args = [self.eval_data(argument, state, value, env) for argument in node.get("args", [])]
             return builtin_call(name, args)
         if node.kind == "ifexpr":
+            all_leaves = [node.get("then")] + [branch_value for _, branch_value in node.get("elifs", [])] + [node.get("else_")]
             condition = self.eval_data(node.get("cond"), state, value, env)
-            if condition is UNKNOWN:
-                return UNKNOWN
+            if condition is UNKNOWN or is_phi(condition):
+                return phi_from_leaves(all_leaves, lambda leaf: self.eval_data(leaf, state, value, env))
             if truthy(condition):
                 return self.eval_data(node.get("then"), state, value, env)
-            for branch_condition, branch_value in node.get("elifs", []):
-                branch = self.eval_data(branch_condition, state, value, env)
-                if branch is UNKNOWN:
-                    return UNKNOWN
-                if truthy(branch):
+            pending = list(node.get("elifs", []))
+            index = 0
+            while index < len(pending):
+                branch_condition, branch_value = pending[index]
+                branch_result = self.eval_data(branch_condition, state, value, env)
+                if branch_result is UNKNOWN or is_phi(branch_result):
+                    remaining = [branch_value] + [item for _, item in pending[index + 1:]] + [node.get("else_")]
+                    return phi_from_leaves(remaining, lambda leaf: self.eval_data(leaf, state, value, env))
+                if truthy(branch_result):
                     return self.eval_data(branch_value, state, value, env)
+                index += 1
             return self.eval_data(node.get("else_"), state, value, env)
         return UNKNOWN
 
@@ -410,7 +428,7 @@ class DispatcherPass:
 
     def eval_condition(self, node: Node, state: Binding, value: int | float, env: dict[int, Any]) -> bool:
         result = self.eval_data(node, state, value, env)
-        if result is UNKNOWN:
+        if result is UNKNOWN or is_phi(result):
             raise DispatcherBail("dynamic dispatcher condition")
         return truthy(result)
 
@@ -446,6 +464,27 @@ class DispatcherPass:
         visit_pair(node, clone)
         return clone
 
+    def record_condition_value(self, condition: Node | None, value: bool, env: dict[int, Any], state: Binding | None = None) -> None:
+        """Remember a branch decision in the path environment so re-tests of
+        the same binding along this path resolve instead of forking again
+        (luast emits `if X then A else if X then B end` chains whose inner
+        tests are provably dead on their path)."""
+        current = condition
+        while isinstance(current, Node) and current.kind == "paren":
+            current = current.get("expr")
+        if not isinstance(current, Node):
+            return
+        if current.kind == "name":
+            binding = binding_for(self.analyzer, current)
+            if binding is not None and (state is None or binding is not state):
+                env[binding.ident] = value
+        elif current.kind == "unop" and current.get("op") == "not":
+            inner = current.get("expr")
+            if isinstance(inner, Node) and inner.kind == "name":
+                binding = binding_for(self.analyzer, inner)
+                if binding is not None and (state is None or binding is not state):
+                    env[binding.ident] = not value
+
     def execute(self, statements: list[Node], state: Binding, value: int | float, conditions: list[tuple[Node, bool]], actions: list[Node], depth: int = 0, env: dict[int, Any] | None = None) -> list[DispatchPath]:
         self.work += 1
         if self.work > self.max_work:
@@ -470,6 +509,11 @@ class DispatcherPass:
                     if evaluated is UNKNOWN or not is_number(evaluated):
                         if values[0].kind == "ifexpr":
                             return self.expand_state_ifexpr(values[0], statements, statement_index, state, current_value, current_conditions, current_actions, current_env, depth)
+                        if is_phi(evaluated):
+                            if all(type(item) is type(evaluated.values[0]) and item == evaluated.values[0] for item in evaluated.values):
+                                evaluated = evaluated.values[0]
+                            else:
+                                raise DispatcherBail("phi state value")
                         if evaluated is UNKNOWN:
                             raise DispatcherBail("dynamic state value")
                         # Non-number sentinel (LUAST junk transition, e.g.
@@ -537,6 +581,7 @@ class DispatcherPass:
                     selected = statement.get("then", [])
                 else:
                     selected = self.else_chain(statement)
+                self.record_condition_value(statement.get("cond"), condition_value, current_env, state)
                 paths.extend(self.execute(selected, state, current_value, current_conditions, current_actions, depth + 1, current_env))
                 return paths
             if kind == "do":
@@ -604,6 +649,8 @@ class DispatcherPass:
             if selected is False:
                 continue
             branch_env = dict(env)
+            if condition is not None:
+                self.record_condition_value(condition, True, branch_env, state)
             if leaf is None:
                 # `state = if c then v` with a false condition leaves the
                 # state unchanged; treat it as an edge to the same state.
@@ -629,13 +676,20 @@ class DispatcherPass:
         condition = statement.get("cond")
         branch_env = dict(env or {})
         result: list[DispatchPath] = []
-        result.extend(self.execute(statement.get("then", []), state, value, conditions + [(condition, True)], list(actions), depth + 1, branch_env))
+        then_env = dict(branch_env)
+        self.record_condition_value(condition, True, then_env, state)
+        result.extend(self.execute(statement.get("then", []), state, value, conditions + [(condition, True)], list(actions), depth + 1, then_env))
         current = list(statement.get("elifs", []))
         prior = condition
         for branch_condition, branch_body in current:
-            result.extend(self.execute(branch_body, state, value, conditions + [(prior, False), (branch_condition, True)], list(actions), depth + 1, branch_env))
+            elif_env = dict(branch_env)
+            self.record_condition_value(prior, False, elif_env, state)
+            self.record_condition_value(branch_condition, True, elif_env, state)
+            result.extend(self.execute(branch_body, state, value, conditions + [(prior, False), (branch_condition, True)], list(actions), depth + 1, elif_env))
             prior = branch_condition
-        result.extend(self.execute(statement.get("else_", []), state, value, conditions + [(prior, False)], list(actions), depth + 1, branch_env))
+        else_env = dict(branch_env)
+        self.record_condition_value(prior, False, else_env, state)
+        result.extend(self.execute(statement.get("else_", []), state, value, conditions + [(prior, False)], list(actions), depth + 1, else_env))
         return result
 
     def contains_state(self, node: Node | None, state: Binding) -> bool:
@@ -659,11 +713,13 @@ class DispatcherPass:
     def recover(self, dispatcher: Dispatcher) -> Node | None:
         self.work = 0
         self.emit_budget = 40000
+        self.emit_nodes = 0
         graph: dict[Any, list[DispatchPath]] = {}
         initial = self.apply_transform(dispatcher.initial, dispatcher.transform)
         queue: list[tuple[int | float, dict[int, Any]]] = [(initial, dict(self.base_env))]
         seen: dict[Any, dict[int, Any]] = {}
         requeues: dict[Any, int] = {}
+        graph_actions = 0
         while queue:
             value, incoming_env = queue.pop(0)
             key = self.key(value)
@@ -697,6 +753,13 @@ class DispatcherPass:
                     normalized.append(path)
                 if len(normalized) > self.max_paths:
                     raise DispatcherBail("path limit")
+            # Bound the resident graph: every path holds cloned statement
+            # subtrees, so a pathological dispatcher can otherwise pin
+            # gigabytes. Count real nodes, not just top-level statements.
+            graph_actions += sum(count_nodes(action) for path in normalized for action in path.actions)
+            graph_actions += len(normalized)
+            if graph_actions > 800000:
+                raise DispatcherBail("graph budget")
             graph[key] = normalized
         self.stats.dispatchers_found += 1
         self.stats.states_recovered += len(graph)
@@ -787,6 +850,9 @@ class DispatcherPass:
         if self.emit_budget < 0:
             raise DispatcherBail("emit budget")
         actions = [action.clone() for action in path.actions]
+        self.emit_nodes += sum(count_nodes(action) for action in actions) + 1
+        if self.emit_nodes > self.max_emit_nodes:
+            raise DispatcherBail("emit size")
         if actions and any(action.kind in {"local", "localfunc"} for action in actions):
             actions = [Node("do", actions[0].start, actions[-1].end, body=actions)]
         outcome = path.outcome

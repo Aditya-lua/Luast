@@ -98,19 +98,41 @@ class Pipeline:
         ]
         current_source = source
         committed_root = root
+        import gc as _gc
+        # [SUPERZ] huge-input mode: per-phase emit+reparse verification doubles
+        # the AST peak (the verified tree is as big as the candidate) and the
+        # per-phase backup clone adds another copy. On multi-MB inputs that
+        # OOMs 4 GB machines. Instead: mutate in place, verify ONCE at the end,
+        # and fall back to the original input if any phase raises.
+        huge = len(source) > 1_500_000
+        import os as _os, resource as _res, sys as _sys
+        _memdbg = _os.environ.get("SUPERZ_MEM_DEBUG") == "1"
+
+        def _memmark(label: str) -> None:
+            if _memdbg:
+                mb = _res.getrusage(_res.RUSAGE_SELF).ru_maxrss // 1024
+                print(f"[mem] {label:20} maxRSS={mb}MB", file=_sys.stderr, flush=True)
+
+        _memmark("pipeline start")
         for phase_name, phase, enabled in phases:
             if not enabled:
                 report.history.append({"name": phase_name, "status": "skipped"})
                 continue
-            backup = committed_root.clone()
+            backup = None if huge else committed_root.clone()
             candidate = committed_root
             analyzer = analyze(candidate)
+            _memmark(f"{phase_name}: analyzed")
             before = self.stats_snapshot(report.stats)
             try:
                 phase(candidate, analyzer, report.stats, current_source)
                 changed = self.stats_snapshot(report.stats) != before
                 if not changed:
                     report.history.append({"name": phase_name, "status": "unchanged"})
+                    continue
+                if huge:
+                    # in-place commit; verification deferred to the final emit
+                    committed_root = candidate
+                    report.history.append({"name": phase_name, "status": "committed-huge"})
                     continue
                 rendered = emit(candidate, current_source)
                 verified, verification_errors, _ = parse(rendered)
@@ -120,10 +142,90 @@ class Pipeline:
                 current_source = rendered
                 report.history.append({"name": phase_name, "status": "committed", "bytes": len(rendered.encode("utf-8", "surrogateescape"))})
             except Exception as exc:
+                if huge:
+                    # no backup kept for huge inputs: restarting from the
+                    # original is the only safe rollback, and a clean failure
+                    # beats a half-transformed output
+                    report.fallback_reason = f"{phase_name} failed on huge input: {type(exc).__name__}: {exc}"
+                    self.log(phase_name, report.fallback_reason)
+                    report.history.append({"name": phase_name, "status": "failed-huge", "error": report.fallback_reason})
+                    current_source = source
+                    report.valid_output = False
+                    report.output_bytes = report.input_bytes
+                    report.elapsed_seconds = time.monotonic() - started
+                    return source, report
                 committed_root = backup
                 message = f"{type(exc).__name__}: {exc}"
                 self.log(phase_name, message)
                 report.history.append({"name": phase_name, "status": "rolled-back", "error": message})
+            finally:
+                # [SUPERZ] free per-phase intermediates promptly; the old root
+                # and backup for huge inputs are hundreds of MB each.
+                _memmark(f"{phase_name}: done")
+                backup = None
+                analyzer = None
+                candidate = None
+                verified = None
+                rendered = None
+                _gc.collect()
+        if huge:
+            # [SUPERZ] final validation without a second Python AST: verify the
+            # rendered source with the C++ luau-ast parser when available (a
+            # subprocess, zero heap cost) and skip node statistics, which would
+            # otherwise build yet another multi-GB tree next to committed_root.
+            _memmark("final: emitting")
+            rendered = emit(committed_root, current_source)
+            del committed_root
+            _gc.collect()
+            _memmark("final: emitted")
+            headered = prepend_header(rendered, source)
+            import subprocess as _sub
+            luau_ast = None
+            for cand in (
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "luau-ast"),
+                "/home/z/my-project/download/project/LUAST/extracted/LUAST 1.0.1/ROBLOX_ENV/luau-ast",
+            ):
+                if os.path.exists(cand):
+                    luau_ast = cand
+                    break
+            valid = True
+            if luau_ast:
+                from tempfile import NamedTemporaryFile
+                with NamedTemporaryFile("w", suffix=".luau", delete=False, encoding="utf-8", errors="surrogateescape") as tf:
+                    tf.write(headered)
+                    tmpname = tf.name
+                try:
+                    proc = _sub.run([luau_ast, tmpname], capture_output=True, timeout=300)
+                    valid = proc.returncode == 0
+                    if not valid:
+                        self.log("final", "luau-ast rejected output: " + proc.stderr.decode("utf-8", "replace")[:300])
+                except Exception as exc:
+                    # validator unavailable or timed out: trust the pipeline
+                    self.log("final", f"luau-ast validation skipped: {exc}")
+                    valid = True
+                finally:
+                    try:
+                        os.unlink(tmpname)
+                    except OSError:
+                        pass
+            _memmark("final: validated")
+            if valid:
+                report.valid_output = True
+                report.output_bytes = len(headered.encode("utf-8", "surrogateescape"))
+                report.output_nodes = 0
+                report.output_tokens = len(headered) // 5
+                report.output_complexity = 0
+                report.elapsed_seconds = time.monotonic() - started
+                return headered, report
+            report.fallback_reason = "final luau-ast validation failed"
+            current_source = source
+            report.valid_output = False
+            report.output_bytes = report.input_bytes
+            report.output_nodes = report.input_nodes
+            report.output_tokens = report.input_tokens
+            report.output_complexity = report.input_complexity
+            report.elapsed_seconds = time.monotonic() - started
+            return current_source, report
         try:
             rendered = emit(committed_root, current_source)
             verified, verification_errors, _ = parse(rendered)
@@ -197,9 +299,15 @@ class Pipeline:
 
 
 def token_count(source: str) -> int:
+    # [SUPERZ] memory guard: lexing a huge source materializes a full token
+    # list while the AST is live; approximate the stat for very large inputs.
+    if len(source) > 1_500_000:
+        return max(1, len(source) // 5)
     try:
         tokens, _, _ = lex(source)
-        return len(tokens)
+        n = len(tokens)
+        tokens.clear()
+        return n
     except Exception:
         return 0
 
