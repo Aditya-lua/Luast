@@ -3,3 +3,6 @@ node_modules/
 __pycache__/
 *.pyc
 scratch/
+
+# local-only notes (not committed)
+*.local.md
