@@ -85,6 +85,10 @@ Drop the official `luau` / `luau-ast` binaries (from the
 
 ## Support / Donate
 
+<div align="center">
+  <img src="assets/donate/donate_header.png" width="520" alt="Buy me a coffee — fund future projects">
+</div>
+
 If these tools are useful to you, you can help fund future projects by sending
 crypto to the addresses below. Thank you for the support. — **@adi.codz** (Discord)
 
