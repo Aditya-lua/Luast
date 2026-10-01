@@ -82,3 +82,20 @@ Drop the official `luau` / `luau-ast` binaries (from the
 
 - **@adi.codz** on Discord
 
+
+## Support / Donate
+
+If these tools are useful to you, you can help fund future projects by sending
+crypto to the addresses below. Thank you for the support. — **@adi.codz** (Discord)
+
+| Network | Address | Scan |
+|---|---|---|
+| **Bitcoin** (BTC) | `bc1q3nprh6e0y4fz88ft4uu5dad7xsx629z498dkay` | <img src="assets/donate/btc.png" width="120" alt="Bitcoin QR"> |
+| **Ethereum** (ERC-20) | `0x11369a1d18eb442581D1e675dAdD94eBA1c4bE52` | <img src="assets/donate/eth.png" width="120" alt="Ethereum QR"> |
+| **BNB Smart Chain** (BEP-20) | `0x11369a1d18eb442581D1e675dAdD94eBA1c4bE52` | <img src="assets/donate/bnb.png" width="120" alt="BNB Smart Chain QR"> |
+| **Solana** (SOL) | `AVKBDNT2PzYDJ7njVrjt7MoVZ1tY4DvNSsADdujiGKTC` | <img src="assets/donate/sol.png" width="120" alt="Solana QR"> |
+| **Litecoin** (LTC) | `ltc1qu4ahsjff622xqjlqwafhlgmacd5ea477sqpx9z` | <img src="assets/donate/ltc.png" width="120" alt="Litecoin QR"> |
+
+> Send each asset only on its own network. ETH and BNB share one EVM address —
+> use it for ERC-20 on Ethereum and BEP-20 on BNB Smart Chain. Assets sent on the
+> wrong network may be lost.
